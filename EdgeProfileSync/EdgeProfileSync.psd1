@@ -28,7 +28,8 @@
     PrivateData          = @{
         PSData = @{
             Tags         = @('Edge', 'MicrosoftEdge', 'EdgeProfiles', 'Profiles', 'Backup', 'Restore', 'Sync', 'Bookmarks', 'OneDrive', 'Windows', 'PSEdition_Core')
-            LicenseUri   = 'https://opensource.org/licenses/MIT'
+            LicenseUri   = 'https://github.com/StevenVBeek/EdgeProfileSync/blob/main/LICENSE'
+            ProjectUri   = 'https://github.com/StevenVBeek/EdgeProfileSync'
             ReleaseNotes = @'
 2.0.0 - complete rewrite of EDGEProfiles (by Michael Mardahl / MSEndpointMgr) for PowerShell 7.4+.
 - Fast: copies a whitelist of profile files instead of zipping the whole User Data folder.
