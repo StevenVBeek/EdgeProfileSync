@@ -222,7 +222,13 @@ function Get-EdgeSyncSanitizedInfoCache {
 function Write-EdgeSyncProfileInfo {
     <#
     .SYNOPSIS
-        Writes <StoreProfilePath>\profile.json: { Name, Key, InfoCache (sanitised), UpdatedUtc, Machine }.
+        Writes <StoreProfilePath>\profile.json: { Name, Key, InfoCache (sanitised), UpdatedUtc, Machine,
+        SourceDirectory, Protected }.
+    .DESCRIPTION
+        SourceDirectory is the profile folder on the pushing machine; Protected is $true when the pushing
+        profile is protected (Test-EdgeProtectedProfile: 'Default' or signed in). Protected is sticky:
+        once a store profile is marked protected it stays protected, so other machines never create or
+        pull it without -IncludeProtectedProfiles.
     #>
     [CmdletBinding()]
     param(
@@ -234,14 +240,36 @@ function Write-EdgeSyncProfileInfo {
     if (-not (Test-Path -LiteralPath $StoreProfilePath -PathType Container)) {
         $null = New-Item -Path $StoreProfilePath -ItemType Directory -Force
     }
-    $info = [ordered]@{
-        Name       = [string]$LocalProfile.Name
-        Key        = $Key
-        InfoCache  = Get-EdgeSyncSanitizedInfoCache -InfoCache (Get-EdgeSyncValue $LocalProfile 'InfoCache')
-        UpdatedUtc = [datetime]::UtcNow.ToString('o')
-        Machine    = $MachineId
+    $file = Join-Path $StoreProfilePath 'profile.json'
+    $protected = [bool](Test-EdgeProtectedProfile -InputObject $LocalProfile)
+    if (-not $protected -and (Test-Path -LiteralPath $file -PathType Leaf)) {
+        try { $protected = Test-EdgeSyncStoreProfileProtected -Info (Read-EdgeJsonFile -Path $file) }
+        catch { Write-EdgeSyncEvent "Store profile file '$file' could not be read: $($_.Exception.Message)" -Level Warning }
     }
-    Write-EdgeJsonFile -Path (Join-Path $StoreProfilePath 'profile.json') -InputObject $info
+    $info = [ordered]@{
+        Name            = [string]$LocalProfile.Name
+        Key             = $Key
+        InfoCache       = Get-EdgeSyncSanitizedInfoCache -InfoCache (Get-EdgeSyncValue $LocalProfile 'InfoCache')
+        UpdatedUtc      = [datetime]::UtcNow.ToString('o')
+        Machine         = $MachineId
+        SourceDirectory = [string](Get-EdgeSyncValue $LocalProfile 'Directory')
+        Protected       = $protected
+    }
+    Write-EdgeJsonFile -Path $file -InputObject $info
+}
+
+function Test-EdgeSyncStoreProfileProtected {
+    <#
+    .SYNOPSIS
+        $true when a store profile (profile.json content) comes from a protected profile: Protected is
+        true or SourceDirectory is 'Default'. Older entries without these fields count as not protected.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][object]$Info)
+    if ($null -eq $Info) { return $false }
+    if (ConvertTo-EdgeSyncBool (Get-EdgeSyncValue $Info 'Protected') -Default $false) { return $true }
+    [string](Get-EdgeSyncValue $Info 'SourceDirectory') -eq 'Default'
 }
 
 function Read-EdgeSyncState {

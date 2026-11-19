@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-11-19
+
+### Added
+
+- Protected profiles: the `Default` profile and every profile signed in with an account (typically the
+  work profile) are left alone by `Restore-EdgeProfiles`, `Sync-EdgeProfiles` and `Remove-EdgeProfile`
+  unless `-IncludeProtectedProfiles` is given (`IncludeProtectedProfiles` in the sync configuration).
+  Protected profiles in a backup or in the sync folder are not restored or created on other machines.
+  `Get-EdgeProfile` shows a `Protected` column.
+- `Restore-EdgeProfiles -ExistingDataAction Replace`: start fresh from a backup while keeping the protected
+  profiles and Local State (with the key that protects their passwords and cookies). Every other local
+  profile is moved aside first.
+- Warning when the old EDGEProfiles module (same command names, different parameters) is also installed.
+
+### Changed
+
+- `-ExistingDataAction Rename` / `Remove`, full-backup and 1.x restores refuse to run while protected
+  profiles exist, unless `-IncludeProtectedProfiles` is given: they replace Local State and with it the
+  encryption key of the Default/work profile.
+- The sync folder's `profile.json` records `SourceDirectory` and `Protected`.
+
+### Fixed
+
+- Sizes of backups on OneDrive with cloud-only files were reported as 0 B.
+- The restore summary under `-WhatIf` reports what would be restored.
+
 ## [2.1.1] - 2026-11-19
 
 ### Changed

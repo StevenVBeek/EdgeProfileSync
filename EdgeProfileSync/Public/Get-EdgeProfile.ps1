@@ -5,7 +5,8 @@ function Get-EdgeProfile {
 
     .DESCRIPTION
         Returns one object per Edge profile (from 'Local State') for each selected channel:
-        Channel, Directory, Name, Key (used in backups and sync), Account, IsSignedIn, LastActiveUtc /
+        Channel, Directory, Name, Key (used in backups and sync), Account, IsSignedIn, Protected (why restore,
+        sync and cleanup leave the profile alone: 'Default profile' / 'signed in with an account'), LastActiveUtc /
         LastActive (local time), InUse (loaded by a running Edge), BookmarkCount, ExtensionCount,
         PendingExtensions (extensions still to install, see Install-EdgeProfileExtension), SizeMB (only
         with -IncludeSize: the whole profile folder) and SyncState ('Synced', 'LocalOnly',
@@ -94,6 +95,7 @@ function Get-EdgeProfile {
                     Key               = $p.Key
                     Account           = $p.PSObject.Properties['Account'] ? [string]$p.Account : ''
                     IsSignedIn        = [bool]$p.IsSignedIn
+                    Protected         = $isOrphan ? '' : (Test-EdgeProtectedProfile $p -Reason)
                     LastActiveUtc     = $lastActiveUtc
                     LastActive        = $lastActiveUtc ? ([datetime]$lastActiveUtc).ToLocalTime() : $null
                     InUse             = Test-EdgeProfileInUse -Path $p.Path

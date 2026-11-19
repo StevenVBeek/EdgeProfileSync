@@ -40,6 +40,7 @@ Describe 'Get-EdgeProfileSyncConfig' {
         $config.ExcludeProfiles.Count | Should -Be 0
         $config.ArchiveRetention | Should -Be 10
         $config.CloseBackgroundEdge | Should -BeTrue
+        $config.IncludeProtectedProfiles | Should -BeFalse
         $config.IntervalMinutes | Should -Be 30
         $config.SyncRoot | Should -BeNullOrEmpty
     }
@@ -90,6 +91,19 @@ Describe 'Set-EdgeProfileSyncConfig' {
         $config.ArchiveRetention | Should -Be 3
         $config.CloseBackgroundEdge | Should -BeFalse
         $config.IntervalMinutes | Should -Be 60
+    }
+
+    It 'round-trips IncludeProtectedProfiles (default off)' {
+        (Get-EdgeProfileSyncConfig).IncludeProtectedProfiles | Should -BeFalse
+        Set-EdgeProfileSyncConfig -IncludeProtectedProfiles $true
+        (Get-EdgeProfileSyncConfig).IncludeProtectedProfiles | Should -BeTrue
+        $json = Get-Content -Raw -LiteralPath (Join-Path $env:EDGEPROFILESYNC_HOME 'config.json') | ConvertFrom-Json -AsHashtable
+        $json['IncludeProtectedProfiles'] | Should -BeTrue
+        Set-EdgeProfileSyncConfig -IncludeProtectedProfiles $false
+        (Get-EdgeProfileSyncConfig).IncludeProtectedProfiles | Should -BeFalse
+        # Hand-edited string values are tolerated, like CloseBackgroundEdge / RemoveDeletedProfiles.
+        '{"IncludeProtectedProfiles":"true"}' | Set-Content -LiteralPath (Join-Path $env:EDGEPROFILESYNC_HOME 'config.json')
+        (Get-EdgeProfileSyncConfig).IncludeProtectedProfiles | Should -BeTrue
     }
 
     It 'only changes the parameters that are passed' {
