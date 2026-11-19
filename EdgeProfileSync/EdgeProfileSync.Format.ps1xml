@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Configuration>
+  <ViewDefinitions>
+    <View>
+      <Name>EdgeProfileSync.Profile</Name>
+      <ViewSelectedBy>
+        <TypeName>EdgeProfileSync.Profile</TypeName>
+      </ViewSelectedBy>
+      <GroupBy>
+        <PropertyName>Channel</PropertyName>
+        <Label>Channel</Label>
+      </GroupBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Name</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Directory</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Account</Label></TableColumnHeader>
+          <TableColumnHeader><Label>LastActive</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Bookmarks</Label><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>SizeMB</Label><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>InUse</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Name</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Directory</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Account</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.LastActive) { $_.LastActive.ToString('yyyy-MM-dd HH:mm') }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>BookmarkCount</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>SizeMB</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>InUse</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+  </ViewDefinitions>
+</Configuration>
