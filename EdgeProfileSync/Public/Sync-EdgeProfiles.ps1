@@ -21,6 +21,14 @@ function Sync-EdgeProfiles {
         profile needs Edge of that channel fully closed. Profiles deleted on another machine with
         Remove-EdgeProfile (tombstones) are never pushed or re-created.
 
+        Protected profiles are left alone by default: the 'Default' profile and every profile signed in
+        with an account (see Test-EdgeProtectedProfile) are never pushed, pulled into, created or removed.
+        A store profile pushed from a protected profile (profile.json Protected = $true or SourceDirectory
+        'Default') is not created or pulled on other machines either. Each skipped profile is reported
+        once (Category '*', Action Skipped) and listed in the header and summary. Use
+        -IncludeProtectedProfiles (or Set-EdgeProfileSyncConfig -IncludeProtectedProfiles $true) to sync
+        them anyway.
+
         Settings not given as parameters come from Get-EdgeProfileSyncConfig. Everything is logged to
         <LocalDataPath>\logs. One failing profile or category never stops the rest of the run; only
         configuration errors (no usable SyncRoot, unknown channel) throw.
@@ -52,6 +60,11 @@ function Sync-EdgeProfiles {
         Remove-EdgeProfile (tombstone in the store). Requires Edge of that channel fully closed.
         Default: config (normally $false: deleted profiles are only no longer synced).
 
+    .PARAMETER IncludeProtectedProfiles
+        Also sync protected profiles (the 'Default' profile and profiles signed in with an account), and
+        store profiles that were pushed from a protected profile on another machine. Default: config
+        (normally off: protected profiles are never touched).
+
     .PARAMETER ArchiveRetention
         Number of archived versions kept per profile/category in the store (default: config, 10).
 
@@ -71,6 +84,8 @@ function Sync-EdgeProfiles {
         [pscustomobject] per channel, profile and category:
         @{ Channel; Profile; Category; Action; Reason } where Action is InSync, Push, Pull, Skipped,
         Conflict-Push, Conflict-Pull or Error. Extension data items are reported as "ExtensionData:<id>".
+        A protected profile that is not synced gives one result with Category '*', Action Skipped and
+        Reason 'Protected profile (Default or signed in)'.
 
     .EXAMPLE
         Sync-EdgeProfiles
@@ -86,6 +101,11 @@ function Sync-EdgeProfiles {
         Sync-EdgeProfiles -Mode PushOnly -SyncRoot 'D:\Share\EdgeProfileSync'
 
         Only uploads local changes to a different sync folder.
+
+    .EXAMPLE
+        Sync-EdgeProfiles -IncludeProtectedProfiles -IncludeProfile 'Personal'
+
+        Also syncs the profile "Personal" when it is the 'Default' profile or signed in with an account.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -106,6 +126,8 @@ function Sync-EdgeProfiles {
         [switch]$AllowLiveCopy,
 
         [bool]$RemoveDeletedProfiles,
+
+        [switch]$IncludeProtectedProfiles,
 
         [ValidateRange(1, 1000)]
         [int]$ArchiveRetention,
@@ -145,6 +167,7 @@ function Sync-EdgeProfiles {
         if (-not $PSBoundParameters.ContainsKey('ExcludeProfile')) { $ExcludeProfile = @(Get-EdgeSyncValue $config 'ExcludeProfiles' @()) }
         if (-not $PSBoundParameters.ContainsKey('CloseBackgroundEdge')) { $CloseBackgroundEdge = ConvertTo-EdgeSyncBool (Get-EdgeSyncValue $config 'CloseBackgroundEdge') -Default $true }
         if (-not $PSBoundParameters.ContainsKey('RemoveDeletedProfiles')) { $RemoveDeletedProfiles = ConvertTo-EdgeSyncBool (Get-EdgeSyncValue $config 'RemoveDeletedProfiles') -Default $false }
+        $includeProtected = if ($PSBoundParameters.ContainsKey('IncludeProtectedProfiles')) { [bool]$IncludeProtectedProfiles } else { ConvertTo-EdgeSyncBool (Get-EdgeSyncValue $config 'IncludeProtectedProfiles') -Default $false }
         if (-not $PSBoundParameters.ContainsKey('ArchiveRetention')) { $ArchiveRetention = [int](Get-EdgeSyncValue $config 'ArchiveRetention' 10) }
         if ($ArchiveRetention -lt 1) { $ArchiveRetention = 1 }
         $IncludeProfile = @($IncludeProfile | Where-Object { $_ })
@@ -207,6 +230,8 @@ function Sync-EdgeProfiles {
         $createdProfiles = [System.Collections.Generic.List[string]]::new()
         $pendingByProfile = [ordered]@{}
         $changedProfiles = 0
+        $protectedReason = 'Protected profile (Default or signed in)'
+        $protectedNames = [System.Collections.Generic.List[string]]::new()
 
         $addResult = {
             param($r, [long]$Bytes = 0)
@@ -258,6 +283,7 @@ function Sync-EdgeProfiles {
                 foreach ($k in @($localProfiles | ForEach-Object { $_.Key }) + @($storeProfiles | ForEach-Object { $_.Key })) { if ($k -and $seen.Add($k)) { $keys.Add($k) } }
 
                 $entries = [System.Collections.Generic.List[object]]::new()
+                $protectedEntries = [System.Collections.Generic.List[string]]::new()
                 foreach ($key in $keys) {
                     $local = $localProfiles | Where-Object { $_.Key -eq $key } | Select-Object -First 1
                     $stored = $storeProfiles | Where-Object { $_.Key -eq $key } | Select-Object -First 1
@@ -265,14 +291,32 @@ function Sync-EdgeProfiles {
 
                     if ($IncludeProfile.Count -and -not (& $matchesAny $IncludeProfile @($displayName, $key))) { continue }
                     if ($ExcludeProfile.Count -and (& $matchesAny $ExcludeProfile @($displayName, $key))) { continue }
+
+                    # Protected profiles ('Default' or signed in, here or on the machine that pushed it):
+                    # no push, no pull, no create, no removal - unless -IncludeProtectedProfiles.
+                    if (-not $includeProtected) {
+                        $why = if ($local) { [string](Test-EdgeProtectedProfile -InputObject $local -Reason) } else { '' }
+                        if (-not $why -and $stored -and (Test-EdgeSyncStoreProfileProtected -Info $stored.Info)) {
+                            $pushedBy = [string](Get-EdgeSyncValue $stored.Info 'Machine')
+                            $why = 'protected on {0}' -f $(if ($pushedBy) { $pushedBy } else { 'another machine' })
+                        }
+                        if ($why) {
+                            $protectedEntries.Add(('{0} ({1})' -f $displayName, $why))
+                            Write-EdgeSyncEvent "Edge $ch profile '$key' is protected ($why); not synced (use -IncludeProtectedProfiles)." -Level Verbose
+                            & $addResult ([pscustomobject]@{ Channel = $ch; Profile = $key; Category = '*'; Action = 'Skipped'; Reason = $protectedReason })
+                            continue
+                        }
+                    }
                     $entries.Add([pscustomobject]@{ Key = $key; Local = $local; Stored = $stored; DisplayName = $displayName })
                 }
+                foreach ($n in $protectedEntries) { $protectedNames.Add($(if ($multiChannel) { "$n, $ch" } else { $n })) }
                 $plans.Add([pscustomobject]@{
                         Channel       = $ch
                         LocalProfiles = $localProfiles
                         StoreProfiles = $storeProfiles
                         Tombstones    = $tombstones
                         Entries       = $entries
+                        Protected     = $protectedEntries
                     })
             }
             catch {
@@ -309,6 +353,9 @@ function Sync-EdgeProfiles {
                 }
                 catch { Write-Verbose "Edge state of $($plan.Channel) could not be determined: $($_.Exception.Message)" }
                 Write-EdgeStatus ('  {0,-11}: {1}; {2} profile(s) to sync ({3} local, {4} in the store)' -f "Edge $($plan.Channel)", $edgeText, $plan.Entries.Count, $plan.LocalProfiles.Count, $plan.StoreProfiles.Count) -Level Header
+                if ($plan.Protected.Count) {
+                    Write-EdgeStatus ('  Protected (not synced): {0} - use -IncludeProtectedProfiles' -f ($plan.Protected -join ', ')) -Level Header
+                }
                 if ($loadedNames.Count) {
                     Write-EdgeStatus ('  Loaded     : {0} (data is pushed; pulls into these profiles wait until they are closed)' -f ($loadedNames -join ', ')) -Level Header
                 }
@@ -510,8 +557,9 @@ function Sync-EdgeProfiles {
                                 }
                             }
 
-                            # ---- profile.json (display name / avatar for other machines)
-                            if (-not $isWhatIf -and $pctx.Profile -and ($pctx.PushedAny -or -not (Test-Path -LiteralPath (Join-Path $location.Store 'profile.json')))) {
+                            # ---- profile.json (display name / avatar / protected flag for other machines)
+                            $markProtected = $pctx.Profile -and (Test-EdgeProtectedProfile -InputObject $pctx.Profile) -and -not ($stored -and (Test-EdgeSyncStoreProfileProtected -Info $stored.Info))
+                            if (-not $isWhatIf -and $pctx.Profile -and ($pctx.PushedAny -or $markProtected -or -not (Test-Path -LiteralPath (Join-Path $location.Store 'profile.json')))) {
                                 if ($pctx.PushedAny -or (Test-Path -LiteralPath $location.Store -PathType Container)) {
                                     Write-EdgeSyncProfileInfo -StoreProfilePath $location.Store -LocalProfile $pctx.Profile -Key $key -MachineId $machineId
                                 }
@@ -629,6 +677,9 @@ function Sync-EdgeProfiles {
         Write-EdgeStatus ('  Items      : {0}' -f ($itemParts -join ', ')) -Level Header
         Write-EdgeStatus ('  Profiles   : {0} processed, {1} with changes{2}' -f $totalProfiles, $changedProfiles, $(if ($createdProfiles.Count) { ', {0} created ({1})' -f $createdProfiles.Count, ($createdProfiles -join ', ') } else { '' })) -Level Header
         Write-EdgeStatus ('  Data       : {0} pushed, {1} pulled' -f (Format-EdgeSize $bytesStat.Pushed), (Format-EdgeSize $bytesStat.Pulled)) -Level Header
+        if ($protectedNames.Count) {
+            Write-EdgeStatus ('  Protected (not synced): {0} - use -IncludeProtectedProfiles' -f ($protectedNames -join ', ')) -Level Header
+        }
         if ($loadedProfiles.Count) {
             Write-EdgeStatus ('  Waiting    : {0} profile(s) loaded in Edge, pulls retried next run: {1}' -f $loadedProfiles.Count, ($loadedProfiles -join ', ')) -Level Header
         }

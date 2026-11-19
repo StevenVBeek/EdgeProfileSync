@@ -181,27 +181,45 @@ extension files slow; robocopy (`-Format Folder`) is not affected the same way.
 
 ### Restore
 
-**Start fresh on a PC from a backup** (old profiles out, exactly the profiles of the backup in):
+**Start fresh on a PC from a backup** (old profiles out, the profiles of the backup in, while your
+Default / work profile stays exactly as it is):
 
 ```powershell
 $backup = "$env:OneDrive\Edge_Backup\EdgeStable"
 
 # 1. Preview: what would happen
-Restore-EdgeProfiles -Path $backup -ExistingDataAction Rename -CloseEdge -WhatIf
+Restore-EdgeProfiles -Path $backup -ExistingDataAction Replace -CloseEdge -WhatIf
 
-# 2. Do it: Edge is closed, the current "User Data" is renamed to "User Data-<timestamp>" (nothing is
-#    deleted) and a fresh one is built with the profiles from the backup
-Restore-EdgeProfiles -Path $backup -ExistingDataAction Rename -CloseEdge
+# 2. Do it: Edge is closed, every local profile except the protected ones is moved aside into
+#    "User Data\EdgeProfileSync-replaced\<timestamp>\profiles" (nothing is deleted), then the
+#    profiles from the backup are restored
+Restore-EdgeProfiles -Path $backup -ExistingDataAction Replace -CloseEdge
 
 # 3. On another PC than the one the backup came from: reinstall the extensions (one click each)
 Install-EdgeProfileExtension
 
-# 4. Everything fine? Delete the old folder (the restore summary shows its path)
-Remove-Item "$env:LOCALAPPDATA\Microsoft\Edge\User Data-20261119-133140" -Recurse
+# 4. Everything fine? Delete the moved-aside profiles (the restore output shows the path)
+Remove-Item "$env:LOCALAPPDATA\Microsoft\Edge\User Data\EdgeProfileSync-replaced" -Recurse
 ```
 
-Use `-ExistingDataAction Remove` instead of `Rename` to delete the old User Data automatically after a
-successful restore. No separate cleanup is needed beforehand.
+No separate cleanup is needed beforehand.
+
+### Protected profiles: Default and work profiles are left alone
+
+The `Default` profile and every profile that is signed in with an account (typically your work
+profile, which has Edge's own sync and your organization's policies) are **protected**:
+
+- `Restore-EdgeProfiles` never writes into them and does not restore the protected profiles of the
+  backup (the Default/work profile of the machine the backup came from).
+- `Sync-EdgeProfiles` neither pushes nor pulls them, and never creates them on another machine.
+- `Remove-EdgeProfile` skips them (`Default` can never be removed).
+- `-ExistingDataAction Rename` / `Remove` and full-backup restores replace the whole User Data folder,
+  including the protected profiles and the key that protects their passwords and cookies; they refuse
+  to run while protected profiles exist. Use `Replace` instead.
+
+`Get-EdgeProfile` shows the `Protected` column. Add `-IncludeProtectedProfiles` to any of these commands
+(or `Set-EdgeProfileSyncConfig -IncludeProtectedProfiles $true` for the scheduled sync) when you really
+want them included.
 
 Other restores:
 
@@ -385,7 +403,8 @@ Get-EdgeProfile | Where-Object LastActiveUtc -lt (Get-Date).AddMonths(-6) | Remo
 Get-EdgeProfile | Out-ConsoleGridView | Remove-EdgeProfile
 ```
 
-`Remove-EdgeProfile` needs Edge closed (`-CloseEdge` stops it), never removes `Default`, and leaves a
+`Remove-EdgeProfile` needs Edge closed (`-CloseEdge` stops it), never removes `Default`, skips signed-in
+(protected) profiles unless `-IncludeProtectedProfiles`, and leaves a
 marker in the sync folder so other machines don't bring the profile back. To also remove such profiles
 on your other machines automatically: `Set-EdgeProfileSyncConfig -RemoveDeletedProfiles $true` (off by
 default). Use `-LocalOnly` to remove a profile on one machine only, `-Permanent` to skip the Recycle Bin.
@@ -416,6 +435,11 @@ detected and reset. The only supported way to force-install an extension is poli
 (`ExtensionInstallForcelist`), which needs admin rights and applies to *all* profiles, not to one.
 
 ## Limitations
+
+- **The old EDGEProfiles module has the same command names.** If it is still installed (check
+  `Documents\PowerShell\Modules` and `Documents\WindowsPowerShell\Modules`, which OneDrive may sync to all
+  your PCs), Windows PowerShell or a session that loaded it first runs the old commands. EdgeProfileSync
+  warns about this when it loads; remove it with `Uninstall-Module EdgeProfiles -AllVersions`.
 
 - **Protected settings are machine-bound.** Start pages, default search engine and extension
   registration live in `Secure Preferences`, which only restores on the machine it came from. On other

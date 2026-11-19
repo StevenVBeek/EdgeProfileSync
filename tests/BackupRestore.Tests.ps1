@@ -400,7 +400,7 @@ Describe 'Backup and restore' {
 
         It 'Rename restores into a fresh User Data with the original folder names' {
             $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
-            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Rename
+            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Rename -IncludeProtectedProfiles
             $old = @(Get-ChildItem $TestDrive -Directory -Filter 'UserData-*')
             $old.Count | Should -Be 1
             Join-Path $old[0].FullName 'Default\Login Data' | Should -Exist
@@ -412,9 +412,72 @@ Describe 'Backup and restore' {
 
         It 'Remove -Force deletes the previous User Data after restoring' {
             $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
-            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Remove -Force
+            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Remove -Force -IncludeProtectedProfiles
             @(Get-ChildItem $TestDrive -Directory -Filter 'UserData-*').Count | Should -Be 0
             Join-Path $script:UD 'Default\Bookmarks' | Should -Exist
+        }
+
+        It 'refuses Rename/Remove without -IncludeProtectedProfiles when protected profiles exist' {
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
+            { Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Rename } | Should -Throw '*protected*Replace*'
+            { Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Remove -Force } | Should -Throw '*protected*'
+            @(Get-ChildItem $TestDrive -Directory -Filter 'UserData-*').Count | Should -Be 0
+            Join-Path $script:UD 'Default\Login Data' | Should -Exist
+        }
+
+        It 'Merge never writes into a protected local profile and does not restore protected backup profiles' {
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
+            Set-Content (Join-Path $script:UD 'Default\Bookmarks') 'local-default' -NoNewline
+            Set-Content (Join-Path $script:UD 'Profile 1\Bookmarks') 'local-work' -NoNewline
+            $res = @(Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -PassThru)
+            Get-Content (Join-Path $script:UD 'Default\Bookmarks') -Raw | Should -Be 'local-default'
+            Get-Content (Join-Path $script:UD 'Profile 1\Bookmarks') -Raw | Should -Not -Be 'local-work'
+            ($res | Where-Object { $_.Profile -eq 'Personal' -and $_.Action -eq 'Skipped' }).Reason | Should -Match 'Protected'
+            ($res | Where-Object { $_.Profile -eq 'Personal' -and $_.Action -eq 'Restored' }) | Should -BeNullOrEmpty
+
+            # with the switch the Default profile is restored as well
+            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -IncludeProtectedProfiles
+            Get-Content (Join-Path $script:UD 'Default\Bookmarks') -Raw | Should -Not -Be 'local-default'
+        }
+
+        It 'Replace moves unprotected profiles aside, keeps protected ones and Local State, and restores the backup' {
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
+            # local state of "this machine": an extra local profile, a marker in Default, an encryption key
+            $ls = Get-Content (Join-Path $script:UD 'Local State') -Raw | ConvertFrom-Json -AsHashtable
+            $ls['os_crypt'] = @{ encrypted_key = 'KEEP-ME' }
+            $ls.profile.info_cache['Profile 2'] = @{ name = 'Old project'; user_name = '' }
+            $ls.profile.profiles_order += 'Profile 2'
+            Write-TestJson (Join-Path $script:UD 'Local State') $ls
+            $null = New-Item -ItemType Directory -Path (Join-Path $script:UD 'Profile 2') -Force
+            Set-Content (Join-Path $script:UD 'Profile 2\Bookmarks') 'old' -NoNewline
+            Set-Content (Join-Path $script:UD 'Default\Bookmarks') 'local-default' -NoNewline
+
+            $res = @(Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Replace -PassThru)
+
+            $after = @(Get-EdgeProfile -UserDataRoot $script:UD -SyncRoot (Join-Path $TestDrive 'nosync'))
+            $after.Name | Should -Not -Contain 'Old project'
+            $after.Name | Should -Contain 'Work'
+            $after.Name | Should -Contain 'Personal'
+            Get-Content (Join-Path $script:UD 'Default\Bookmarks') -Raw | Should -Be 'local-default'
+            Join-Path $script:UD 'Default\Login Data' | Should -Exist
+            (Get-Content (Join-Path $script:UD 'Local State') -Raw | ConvertFrom-Json -AsHashtable).os_crypt.encrypted_key | Should -Be 'KEEP-ME'
+            @(Get-ChildItem (Join-Path $script:UD 'EdgeProfileSync-replaced') -Recurse -Directory -Filter 'Profile 2').Count | Should -Be 1
+            ($res | Where-Object { $_.Profile -eq 'Work' -and $_.Action -eq 'Restored' }) | Should -Not -BeNullOrEmpty
+            Join-Path ($after | Where-Object Name -eq 'Work').Path 'Bookmarks' | Should -Exist
+            @(Get-ChildItem $TestDrive -Directory -Filter 'UserData-*').Count | Should -Be 0
+        }
+
+        It 'Remove-EdgeProfile skips signed-in profiles unless -IncludeProtectedProfiles' {
+            $ls = Get-Content (Join-Path $script:UD 'Local State') -Raw | ConvertFrom-Json -AsHashtable
+            $ls.profile.info_cache['Profile 1'].user_name = 'work@example.com'
+            Write-TestJson (Join-Path $script:UD 'Local State') $ls
+            (Get-EdgeProfile -UserDataRoot $script:UD -Name Work).Protected | Should -Be 'signed in with an account'
+            (Get-EdgeProfile -UserDataRoot $script:UD -Name Personal).Protected | Should -Be 'Default profile'
+            $res = @(Remove-EdgeProfile -Name Work -UserDataRoot $script:UD -SkipBackup -LocalOnly -Permanent -Force -PassThru -WarningAction SilentlyContinue)
+            $res[0].Action | Should -Be 'Skipped'
+            Join-Path $script:UD 'Profile 1' | Should -Exist
+            $res2 = @(Remove-EdgeProfile -Name Work -UserDataRoot $script:UD -SkipBackup -LocalOnly -Permanent -Force -PassThru -IncludeProtectedProfiles)
+            $res2[0].Action | Should -Be 'Removed'
         }
 
         It 'filters by -Profile and -Category' {
@@ -439,7 +502,7 @@ Describe 'Backup and restore' {
         It 'refuses Rename while Edge is running without -CloseEdge' {
             $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
             Mock -ModuleName EdgeProfileSync Get-EdgeProcessState { [pscustomobject]@{ Running = $true; HasWindows = $true; ProcessCount = 5 } }
-            { Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Rename } | Should -Throw '*running*'
+            { Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Rename -IncludeProtectedProfiles } | Should -Throw '*running*'
             Join-Path $script:UD 'Default\Login Data' | Should -Exist
             Should -Invoke -ModuleName EdgeProfileSync Stop-EdgeProcess -Times 0
         }
@@ -469,7 +532,7 @@ Describe 'Backup and restore' {
 
         It 'restores a -Full backup' {
             $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -Full -PassThru
-            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Remove -Force
+            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -ExistingDataAction Remove -Force -IncludeProtectedProfiles
             Join-Path $script:UD 'Default\Login Data' | Should -Exist
             Join-Path $script:UD 'Local State' | Should -Exist
             Join-Path $script:UD 'Default\Cache' | Should -Not -Exist
@@ -483,7 +546,7 @@ Describe 'Backup and restore' {
             [IO.Compression.ZipFile]::CreateFromDirectory($src, $zip)
             Set-Content (Join-Path $script:UD 'Default\Bookmarks') 'p' -NoNewline
 
-            $null = Restore-EdgeProfiles -ZIPSource $zip -UserDataRoot $script:UD -ExistingDataAction Remove -Force
+            $null = Restore-EdgeProfiles -ZIPSource $zip -UserDataRoot $script:UD -ExistingDataAction Remove -Force -IncludeProtectedProfiles
             Get-Content (Join-Path $script:UD 'Default\Bookmarks') -Raw | Should -Not -Be 'p'
             Join-Path $script:UD 'Default\Login Data' | Should -Exist
         }

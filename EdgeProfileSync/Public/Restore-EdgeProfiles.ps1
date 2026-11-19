@@ -7,14 +7,24 @@ function Restore-EdgeProfiles {
         Restores the categories in the backup into the matching local profiles. Backup profiles are
         matched to local profiles by Key (derived from the display name); missing profiles are created.
 
+        Protected profiles are never touched unless -IncludeProtectedProfiles is given: the 'Default'
+        profile and every profile signed in with an account (typically the work profile). That applies to
+        both sides: protected local profiles are not overwritten or removed, and protected profiles in the
+        backup (the Default or signed-in profiles of the machine the backup came from) are not restored.
+
         -ExistingDataAction:
-          Merge  (default) Per category, the existing files are moved aside into
-                 "<User Data>\EdgeProfileSync-replaced\<timestamp>\<profile>\<category>\" and then
-                 replaced by the backup. Profiles and categories that are not in the backup are untouched.
-          Rename The whole User Data folder is renamed to "User Data-<timestamp>" and the backup is
-                 restored into a fresh User Data folder (only the restored profiles exist afterwards).
-          Remove As Rename, but the old User Data folder is deleted after a successful restore
-                 (asks for confirmation unless -Force).
+          Merge   (default) Per category, the existing files are moved aside into
+                  "<User Data>\EdgeProfileSync-replaced\<timestamp>\<profile>\<category>\" and then
+                  replaced by the backup. Profiles and categories that are not in the backup are untouched.
+          Replace Start fresh while keeping the protected profiles: every other local profile is moved aside
+                  into "<User Data>\EdgeProfileSync-replaced\<timestamp>\profiles\" and unregistered, then
+                  the backup profiles are restored. Local State (with the key that protects passwords and
+                  cookies of the Default/work profile) stays as it is. Needs Edge closed.
+          Rename  The whole User Data folder is renamed to "User Data-<timestamp>" and the backup is
+                  restored into a fresh User Data folder. This replaces the protected profiles and their
+                  encryption key too, so it requires -IncludeProtectedProfiles when the machine has any.
+          Remove  As Rename, but the old User Data folder is deleted after a successful restore
+                  (asks for confirmation unless -Force). Also requires -IncludeProtectedProfiles.
 
         Machine-bound categories (SecurePreferences, Extensions) are only restored when the backup was
         made on this machine. Extensions: on the same machine with Extensions + SecurePreferences in the
@@ -43,7 +53,10 @@ function Restore-EdgeProfiles {
         Only restore these categories ('All' = everything in the backup). Default: everything in the backup.
 
     .PARAMETER ExistingDataAction
-        Merge (default), Rename or Remove. See the description.
+        Merge (default), Replace, Rename or Remove. See the description.
+
+    .PARAMETER IncludeProtectedProfiles
+        Also restore into, replace or restore the protected profiles (Default and signed-in profiles).
 
     .PARAMETER CloseEdge
         Stop Edge of the channel if it is running (open windows are closed!).
@@ -63,6 +76,12 @@ function Restore-EdgeProfiles {
 
     .EXAMPLE
         Restore-EdgeProfiles -Path .\EdgeStable-20261119-101500.zip -CloseEdge
+
+    .EXAMPLE
+        Restore-EdgeProfiles -Path "$env:OneDrive\Edge_Backup\EdgeStable" -ExistingDataAction Replace -CloseEdge
+
+        Starts fresh from a folder backup: all local profiles except Default and signed-in profiles are moved
+        aside and replaced by the profiles in the backup.
 
     .EXAMPLE
         Restore-EdgeProfiles -Path .\EdgeStable-20261119-101500.zip -Profile Work -Category Bookmarks -WhatIf
@@ -85,8 +104,10 @@ function Restore-EdgeProfiles {
 
         [string[]]$Category,
 
-        [ValidateSet('Merge', 'Rename', 'Remove')]
+        [ValidateSet('Merge', 'Replace', 'Rename', 'Remove')]
         [string]$ExistingDataAction = 'Merge',
+
+        [switch]$IncludeProtectedProfiles,
 
         [switch]$CloseEdge,
 
@@ -104,6 +125,20 @@ function Restore-EdgeProfiles {
     )
     $zipPath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # Replacing the whole User Data folder also replaces the protected profiles (and Local State with its
+    # encryption key): refuse unless explicitly allowed.
+    $assertWholeUserDataAllowed = {
+        param([string]$TargetChannel, [string]$What)
+        if ($IncludeProtectedProfiles) { return }
+        $protectedHere = @(Get-EdgeLocalProfile -Channel $TargetChannel -UserDataRoot $UserDataRoot | Where-Object { Test-EdgeProtectedProfile $_ })
+        if ($protectedHere.Count) {
+            $names = ($protectedHere | ForEach-Object { "'$($_.Name)' ($($_.Directory))" }) -join ', '
+            throw ("$What replaces the whole User Data folder, including the protected profile(s) $names and the key " +
+                'that protects their passwords and cookies. Use -ExistingDataAction Replace to start fresh while keeping ' +
+                'them, or add -IncludeProtectedProfiles if you really want to replace them too.')
+        }
+    }
     $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $results = [System.Collections.Generic.List[object]]::new()
     $addResult = {
@@ -153,9 +188,11 @@ function Restore-EdgeProfiles {
                 throw "'$zipPath' contains neither backup-manifest.json nor an Edge User Data folder."
             }
 
+            if ($ExistingDataAction -eq 'Replace') { $ExistingDataAction = 'Rename' }
+            & $assertWholeUserDataAllowed $ch 'Restoring a 1.x backup'
             $null = Assert-EdgeRestoreAllowed -Channel $ch -CloseEdge:$CloseEdge -RequireClosed -Cmdlet $PSCmdlet
             $oldUserData = Move-EdgeUserDataAside -UserDataPath $userData -Action $ExistingDataAction -Timestamp $timestamp -Force:$Force -Cmdlet $PSCmdlet
-            if ($null -eq $oldUserData -and $ExistingDataAction -ne 'Merge' -and (Test-Path -LiteralPath $userData) -and -not $WhatIfPreference) { return }
+            if ($null -eq $oldUserData -and $ExistingDataAction -in 'Rename', 'Remove' -and (Test-Path -LiteralPath $userData) -and -not $WhatIfPreference) { return }
             if ($oldUserData) { Write-EdgeNote "Previous User Data renamed to '$oldUserData'." -Level Step }
 
             if ($PSCmdlet.ShouldProcess($userData, 'Restore User Data from 1.x backup')) {
@@ -199,6 +236,15 @@ function Restore-EdgeProfiles {
         else { @(Resolve-EdgeBackupCategory -Category $Category | Where-Object Name -in $inBackup) }
 
         $backupProfiles = @(Select-EdgeProfileByFilter -InputObject @($manifest['Profiles']) -Filter $ProfileName)
+        $protectedInBackup = @()
+        if (-not $IncludeProtectedProfiles -and -not $manifest['Full']) {
+            $protectedInBackup = @($backupProfiles | Where-Object { Test-EdgeProtectedProfile $_ })
+            $backupProfiles = @($backupProfiles | Where-Object { -not (Test-EdgeProtectedProfile $_) })
+        }
+        $protectedLocal = @()
+        if (-not $IncludeProtectedProfiles) {
+            $protectedLocal = @(Get-EdgeLocalProfile -Channel $ch -UserDataRoot $UserDataRoot | Where-Object { Test-EdgeProtectedProfile $_ })
+        }
 
         # ---- header
         $created = ''
@@ -209,6 +255,7 @@ function Restore-EdgeProfiles {
         $origin = @($manifest['ComputerName'], $manifest['MachineId']) | Where-Object { $_ } | Select-Object -Unique
         $actionText = switch ($ExistingDataAction) {
             'Merge' { 'Merge - restore into the existing profiles (replaced files are kept aside)' }
+            'Replace' { 'Replace - all local profiles except the protected ones are moved aside, then the backup profiles are restored' }
             'Rename' { 'Rename - current User Data is renamed aside, then a fresh one is built from the backup' }
             'Remove' { 'Remove - current User Data is deleted after a successful restore' }
         }
@@ -219,11 +266,21 @@ function Restore-EdgeProfiles {
                 'Profiles'   = $manifest['Full'] ? $null : ('{0} of {1} in the backup' -f $backupProfiles.Count, @($manifest['Profiles']).Count)
                 'Categories' = $manifest['Full'] ? $null : ($wanted ? (($wanted | ForEach-Object { $_.Name }) -join ', ') : '(none)')
                 'Action'     = "$actionText$($CloseEdge ? '; Edge is closed first' : '')"
+                'Protected'  = $IncludeProtectedProfiles ? 'INCLUDED (-IncludeProtectedProfiles): Default and signed-in profiles may be overwritten' :
+                    ('kept as they are: {0}{1}' -f (($protectedLocal | ForEach-Object { "$($_.Name) ($($_.Directory))" }) -join ', '), ($protectedLocal ? '' : '(none on this machine)'))
+                'Not restored' = $protectedInBackup ? ('protected in the backup: {0}' -f (($protectedInBackup | ForEach-Object { [string]$_['Name'] }) -join ', ')) : $null
                 'Started'    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
             })
         if (-not $sameMachine) {
             Write-EdgeNote 'Backup from another machine: machine-bound data (SecurePreferences, extension binaries, registry) is not restored;' -Level Warning
             Write-EdgeNote 'extensions are listed for reinstall (Install-EdgeProfileExtension).' -Level Warning
+        }
+
+        foreach ($bp in $protectedInBackup) {
+            & $addResult $ch ([string]$bp['Name']) $null '*' 'Skipped' "Protected profile in the backup ($(Test-EdgeProtectedProfile $bp -Reason))"
+        }
+        if ($manifest['Full'] -or $ExistingDataAction -in 'Rename', 'Remove') {
+            & $assertWholeUserDataAllowed $ch ($manifest['Full'] ? 'Restoring a full User Data backup' : "-ExistingDataAction $ExistingDataAction")
         }
 
         if (-not $backupProfiles -and -not $manifest['Full']) {
@@ -237,9 +294,12 @@ function Restore-EdgeProfiles {
         $edgeRunning = Assert-EdgeRestoreAllowed -Channel $ch -CloseEdge:$CloseEdge -RequireClosed:$requireClosed -Cmdlet $PSCmdlet
         if ($edgeRunning) { Write-EdgeNote "Edge $ch is running: profiles that are open in Edge, and profiles that have to be created, are skipped." -Level Warning }
 
-        $fresh = $ExistingDataAction -ne 'Merge' -or -not (Test-Path -LiteralPath $userData -PathType Container)
+        $fresh = $ExistingDataAction -in 'Rename', 'Remove' -or -not (Test-Path -LiteralPath $userData -PathType Container)
         $oldUserData = Move-EdgeUserDataAside -UserDataPath $userData -Action $ExistingDataAction -Timestamp $timestamp -Force:$Force -Cmdlet $PSCmdlet
-        if ($null -eq $oldUserData -and $ExistingDataAction -ne 'Merge' -and (Test-Path -LiteralPath $userData) -and -not $WhatIfPreference) { return }
+        if ($null -eq $oldUserData -and $ExistingDataAction -in 'Rename', 'Remove' -and (Test-Path -LiteralPath $userData) -and -not $WhatIfPreference) { return }
+        if ($ExistingDataAction -eq 'Replace' -and (Test-Path -LiteralPath $userData -PathType Container)) {
+            $null = Clear-EdgeUnprotectedProfile -Channel $ch -UserDataRoot $userData -Timestamp $timestamp -IncludeProtectedProfiles:$IncludeProtectedProfiles -Cmdlet $PSCmdlet
+        }
         if ($oldUserData) { Write-EdgeNote "Previous User Data renamed to '$oldUserData'." -Level Info }
 
         $pendingTotal = 0
@@ -307,6 +367,14 @@ function Restore-EdgeProfiles {
 
                 $target = $localProfiles | Where-Object { $_.Key -eq $key } | Select-Object -First 1
                 $createdNote = ''
+                if ($target -and -not $IncludeProtectedProfiles -and (Test-EdgeProtectedProfile $target)) {
+                    $why = Test-EdgeProtectedProfile $target -Reason
+                    & $addResult $ch $name $target.Directory '*' 'Skipped' "Protected profile ($why)"
+                    Write-EdgeTableRow -Table $table -Values @($pIndex, $name, $target.Directory, '', 'all', '', '', "protected ($why), not touched") -Level Warning
+                    $profSkipped++
+                    Update-EdgeProgress -Progress $progress -Done ($pStart + $pTotal)
+                    continue
+                }
                 if (-not $target -and $edgeRunning) {
                     Write-Warning "Profile '$name' does not exist yet; creating a profile needs Edge $ch closed. Skipped (close Edge or use -CloseEdge)."
                     & $addResult $ch $name $null '*' 'Skipped' 'Edge running: profile creation needs Edge closed'
@@ -430,7 +498,7 @@ function Restore-EdgeProfiles {
         }
 
         $sw.Stop()
-        $restored = @($results | Where-Object Action -eq 'Restored')
+        $restored = @($results | Where-Object Action -in ($WhatIfPreference ? @('Restored', 'WhatIf') : @('Restored')))
         $skipped = @($results | Where-Object Action -eq 'Skipped')
         $failed = @($results | Where-Object Action -eq 'Error')
         $msg = 'Edge {0} restore: {1} profile(s), {2} item(s) restored, {3} skipped, {4} failed, {5}, in {6}{7}.' -f $ch,
@@ -442,7 +510,7 @@ function Restore-EdgeProfiles {
         $boxLevel = ($failed -or $profFailed) ? 'Warning' : 'Success'
         Write-EdgeBox -Title ('Restore {0} in {1}' -f ($WhatIfPreference ? 'preview (WhatIf) finished' : 'finished'), (Format-EdgeDuration $sw.Elapsed)) -Level $boxLevel -Rows ([ordered]@{
                 'Profiles'   = $manifest['Full'] ? $null : ('{0} {1}, {2} skipped, {3} failed (of {4})' -f $profRestored, ($WhatIfPreference ? 'would be restored' : 'restored'), $profSkipped, $profFailed, $backupProfiles.Count)
-                'Categories' = '{0} restored, {1} skipped, {2} failed ({3})' -f $restored.Count, $skipped.Count, $failed.Count, (Format-EdgeSize $restoredBytes)
+                'Categories' = '{0} {1}, {2} skipped, {3} failed ({4})' -f $restored.Count, ($WhatIfPreference ? 'would be restored' : 'restored'), $skipped.Count, $failed.Count, (Format-EdgeSize $restoredBytes)
                 'Replaced'   = (Test-Path -LiteralPath $replacedDir -PathType Container) ? "replaced files are kept in '$replacedDir'" : $null
                 'Previous'   = ($oldUserData -and (Test-Path -LiteralPath $oldUserData)) ? "previous User Data: '$oldUserData' (delete it when everything works)" : $null
                 'Extensions' = $pendingTotal ? "$pendingTotal extension(s) to install: run Install-EdgeProfileExtension" : $null

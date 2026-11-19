@@ -26,15 +26,21 @@ BeforeAll {
 
     function New-TestUserData {
         # Creates a fake "User Data" folder with a Local State listing the given profiles (Directory -> Name).
+        # -SignedIn: directories that are signed in with an account (default: all of them).
         param(
             [Parameter(Mandatory)][string]$Root,
-            [Parameter(Mandatory)][System.Collections.IDictionary]$Profiles
+            [Parameter(Mandatory)][System.Collections.IDictionary]$Profiles,
+            [AllowEmptyCollection()][string[]]$SignedIn
         )
         $null = New-Item -ItemType Directory -Path $Root -Force
         $infoCache = [ordered]@{}
         foreach ($dir in $Profiles.Keys) {
             $null = New-Item -ItemType Directory -Path (Join-Path $Root $dir) -Force
-            $infoCache[$dir] = [ordered]@{ name = $Profiles[$dir]; avatar_icon = 'chrome://theme/IDR_PROFILE_AVATAR_26'; user_name = 'someone@example.com'; gaia_id = '123' }
+            $infoCache[$dir] = [ordered]@{ name = $Profiles[$dir]; avatar_icon = 'chrome://theme/IDR_PROFILE_AVATAR_26' }
+            if (-not $PSBoundParameters.ContainsKey('SignedIn') -or $dir -in $SignedIn) {
+                $infoCache[$dir]['user_name'] = 'someone@example.com'
+                $infoCache[$dir]['gaia_id'] = '123'
+            }
         }
         $localState = [ordered]@{
             ''      = [ordered]@{ empty = $true }   # Local State contains empty property names
@@ -57,7 +63,9 @@ BeforeAll {
     }
 
     function Invoke-TestSync {
-        # Runs Sync-EdgeProfiles as one of the fake machines.
+        # Runs Sync-EdgeProfiles as one of the fake machines. -IncludeProtectedProfiles is on unless
+        # $script:IncludeProtected is $false or -Extra sets it (the mechanics tests use 'Default' and
+        # signed-in profiles).
         param(
             [Parameter(Mandatory)][ValidateSet('PC-A', 'PC-B')][string]$Machine,
             [hashtable]$Extra = @{}
@@ -70,6 +78,7 @@ BeforeAll {
             UserDataRoot = $script:UserData[$Machine]
             WarningAction = 'SilentlyContinue'
         }
+        if ($script:IncludeProtected -ne $false) { $params['IncludeProtectedProfiles'] = $true }
         foreach ($k in $Extra.Keys) { $params[$k] = $Extra[$k] }
         @(Sync-EdgeProfiles @params)
     }
@@ -589,7 +598,7 @@ Describe 'Sync-EdgeProfiles between two machines' {
         Set-TestFile -Path (Join-Path $script:WorkB 'Bookmarks') -Content '{"roots":"B-quiet"}' -TimeUtc ([datetime]::UtcNow)
         $env:EPS_TEST_MACHINE = 'PC-B'
         $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-B']
-        $out = @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-B'] -Quiet -WarningAction SilentlyContinue 6>&1)
+        $out = @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-B'] -IncludeProtectedProfiles -Quiet -WarningAction SilentlyContinue 6>&1)
         $out.Count | Should -Be 0
         # The change was still synced, and quiet mode does not leak into later runs.
         Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Work\Bookmarks\Bookmarks') -Raw | Should -Be '{"roots":"B-quiet"}'
@@ -607,11 +616,11 @@ Describe 'Sync-EdgeProfiles between two machines' {
         Set-TestFile -Path (Join-Path $script:WorkB 'Bookmarks') -Content '{"roots":"B-status"}' -TimeUtc ([datetime]::UtcNow)
         $env:EPS_TEST_MACHINE = 'PC-B'
         $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-B']
-        $b = & $splitOutput @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-B'] -WarningAction SilentlyContinue 6>&1)
+        $b = & $splitOutput @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-B'] -IncludeProtectedProfiles -WarningAction SilentlyContinue 6>&1)
 
         $env:EPS_TEST_MACHINE = 'PC-A'
         $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-A']
-        $a = & $splitOutput @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-A'] -WarningAction SilentlyContinue 6>&1)
+        $a = & $splitOutput @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-A'] -IncludeProtectedProfiles -WarningAction SilentlyContinue 6>&1)
 
         # Result objects: only the five documented properties, nothing else on the success stream.
         foreach ($set in $b.Objects, $a.Objects) {
@@ -647,5 +656,139 @@ Describe 'Sync-EdgeProfiles between two machines' {
             { Sync-EdgeProfiles -UserDataRoot $script:UserData['PC-A'] } | Should -Throw '*SyncRoot*'
         }
         finally { $env:OneDrive = $savedA; $env:OneDriveCommercial = $savedB }
+    }
+}
+
+Describe 'Sync-EdgeProfiles leaves protected profiles alone' {
+    BeforeAll {
+        $script:IncludeProtected = $false
+        $script:SyncRoot = Join-Path $TestDrive 'OneDrive-protected\EdgeProfileSync'
+        $null = New-Item -ItemType Directory -Path (Split-Path $script:SyncRoot) -Force
+        $script:UserData = @{
+            'PC-A' = Join-Path $TestDrive 'Protected-PC-A\User Data'
+            'PC-B' = Join-Path $TestDrive 'Protected-PC-B\User Data'
+        }
+        $script:Homes = @{
+            'PC-A' = Join-Path $TestDrive 'Protected-PC-A\EdgeProfileSync'
+            'PC-B' = Join-Path $TestDrive 'Protected-PC-B\EdgeProfileSync'
+        }
+        $env:EPS_TEST_EDGE = 'closed'
+        $env:EPS_TEST_INUSE = $null
+
+        Mock -ModuleName EdgeProfileSync Get-EdgeSyncMachineId { $env:EPS_TEST_MACHINE }
+        Mock -ModuleName EdgeProfileSync Get-EdgeProcessState { [pscustomobject]@{ Running = $false; HasWindows = $false; ProcessCount = 0 } }
+        Mock -ModuleName EdgeProfileSync Stop-EdgeProcess { $true }
+        Mock -ModuleName EdgeProfileSync Test-EdgeProfileInUse { $false }
+
+        $t0 = [datetime]::UtcNow.AddHours(-2)
+        # PC-A: 'Default' = Personal (not signed in), Work (signed in), Hobby and Shared (plain profiles).
+        New-TestUserData -Root $script:UserData['PC-A'] -SignedIn @('Profile 1') -Profiles ([ordered]@{
+                'Default' = 'Personal'; 'Profile 1' = 'Work'; 'Profile 2' = 'Hobby'; 'Profile 3' = 'Shared' })
+        foreach ($d in 'Default', 'Profile 1', 'Profile 2', 'Profile 3') {
+            Set-TestFile -Path (Join-Path $script:UserData['PC-A'] "$d\Bookmarks") -Content "{`"roots`":`"A-$d`"}" -TimeUtc $t0
+        }
+        # PC-B: 'Default' = Home (not signed in) and a signed-in profile that is also called Shared.
+        New-TestUserData -Root $script:UserData['PC-B'] -SignedIn @('Profile 1') -Profiles ([ordered]@{ 'Default' = 'Home'; 'Profile 1' = 'Shared' })
+        Set-TestFile -Path (Join-Path $script:UserData['PC-B'] 'Default\Bookmarks') -Content '{"roots":"B-home"}' -TimeUtc $t0
+        Set-TestFile -Path (Join-Path $script:UserData['PC-B'] 'Profile 1\Bookmarks') -Content '{"roots":"B-shared"}' -TimeUtc $t0
+
+        function Get-TestLocalKey {
+            param([string]$Machine)
+            InModuleScope EdgeProfileSync -Parameters @{ Root = $script:UserData[$Machine] } { param($Root) @(Get-EdgeLocalProfile -UserDataRoot $Root | ForEach-Object Key) }
+        }
+    }
+
+    AfterAll { $script:IncludeProtected = $null }
+
+    It 'PC-A does not push the Default profile or a signed-in profile by default' {
+        $env:EPS_TEST_MACHINE = 'PC-A'
+        $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-A']
+        $out = @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-A'] -WarningAction SilentlyContinue 6>&1)
+        $info = @($out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData }) -join "`n"
+        $r = @($out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
+
+        foreach ($name in 'Personal', 'Work') {
+            $mine = @($r | Where-Object Profile -eq $name)
+            $mine.Count | Should -Be 1 -Because $name
+            $mine[0].Category | Should -Be '*'
+            $mine[0].Action | Should -Be 'Skipped'
+            $mine[0].Reason | Should -Be 'Protected profile (Default or signed in)'
+            Test-Path -LiteralPath (Join-Path $script:SyncRoot "store\Stable\$name") | Should -BeFalse -Because $name
+        }
+        (Get-TestResult $r 'Hobby' 'Bookmarks').Action | Should -Be 'Push'
+        (Get-TestResult $r 'Shared' 'Bookmarks').Action | Should -Be 'Push'
+        $info | Should -Match 'Protected \(not synced\): Personal \(Default profile\), Work \(signed in with an account\) - use -IncludeProtectedProfiles'
+
+        $hobby = Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Hobby\profile.json') -Raw | ConvertFrom-Json -AsHashtable
+        $hobby.Protected | Should -BeFalse
+        $hobby.SourceDirectory | Should -Be 'Profile 2'
+    }
+
+    It 'PC-B creates plain profiles but never pulls into its protected profiles' {
+        $r = Invoke-TestSync -Machine 'PC-B'
+        (Get-TestResult $r 'Hobby' 'Bookmarks').Action | Should -Be 'Pull'
+        (Get-TestResult $r 'Home' '*').Action | Should -Be 'Skipped'
+        # The store has a plain "Shared" from PC-A; PC-B's "Shared" is signed in: never pulled into or pushed.
+        $shared = @($r | Where-Object Profile -eq 'Shared')
+        $shared.Count | Should -Be 1
+        $shared[0].Reason | Should -Be 'Protected profile (Default or signed in)'
+        Get-Content -LiteralPath (Join-Path $script:UserData['PC-B'] 'Profile 1\Bookmarks') -Raw | Should -Be '{"roots":"B-shared"}'
+        Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Shared\Bookmarks\Bookmarks') -Raw | Should -Be '{"roots":"A-Profile 3"}'
+        Test-Path -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Home') | Should -BeFalse
+        Get-Content -LiteralPath (Join-Path $script:UserData['PC-B'] 'Default\Bookmarks') -Raw | Should -Be '{"roots":"B-home"}'
+    }
+
+    It 'PC-A pushes protected profiles with -IncludeProtectedProfiles and marks them protected in the store' {
+        $r = Invoke-TestSync -Machine 'PC-A' -Extra @{ IncludeProtectedProfiles = $true }
+        (Get-TestResult $r 'Personal' 'Bookmarks').Action | Should -Be 'Push'
+        (Get-TestResult $r 'Work' 'Bookmarks').Action | Should -Be 'Push'
+        $personal = Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Personal\profile.json') -Raw | ConvertFrom-Json -AsHashtable
+        $personal.Protected | Should -BeTrue
+        $personal.SourceDirectory | Should -Be 'Default'
+        $work = Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Work\profile.json') -Raw | ConvertFrom-Json -AsHashtable
+        $work.Protected | Should -BeTrue
+        $work.SourceDirectory | Should -Be 'Profile 1'
+        $work.InfoCache.Keys | Should -Not -Contain 'user_name'
+    }
+
+    It 'PC-B does not create a store profile marked protected by default' {
+        $r = Invoke-TestSync -Machine 'PC-B'
+        foreach ($name in 'Personal', 'Work') {
+            $mine = @($r | Where-Object Profile -eq $name)
+            $mine.Count | Should -Be 1 -Because $name
+            $mine[0].Action | Should -Be 'Skipped'
+            $mine[0].Reason | Should -Be 'Protected profile (Default or signed in)'
+        }
+        $keys = Get-TestLocalKey -Machine 'PC-B'
+        $keys | Should -Not -Contain 'Personal'
+        $keys | Should -Not -Contain 'Work'
+    }
+
+    It 'treats an older store profile with SourceDirectory Default as protected, and one without the fields as not protected' {
+        $info = Join-Path $script:SyncRoot 'store\Stable\Hobby\profile.json'
+        $json = Get-Content -LiteralPath $info -Raw | ConvertFrom-Json -AsHashtable
+        InModuleScope EdgeProfileSync -Parameters @{ Json = $json } {
+            param($Json)
+            $old = @{ Name = 'Old'; Key = 'Old'; InfoCache = @{} }
+            Test-EdgeSyncStoreProfileProtected -Info $old | Should -BeFalse
+            Test-EdgeSyncStoreProfileProtected -Info @{ Name = 'Old'; SourceDirectory = 'Default' } | Should -BeTrue
+            Test-EdgeSyncStoreProfileProtected -Info $Json | Should -BeFalse
+            Test-EdgeSyncStoreProfileProtected -Info $null | Should -BeFalse
+        }
+    }
+
+    It 'PC-B creates and pulls a protected store profile with -IncludeProtectedProfiles' {
+        $r = Invoke-TestSync -Machine 'PC-B' -Extra @{ IncludeProtectedProfiles = $true; IncludeProfile = 'Personal' }
+        (Get-TestResult $r 'Personal' 'Bookmarks').Action | Should -Be 'Pull'
+        $p = InModuleScope EdgeProfileSync -Parameters @{ Root = $script:UserData['PC-B'] } { param($Root) Get-EdgeLocalProfile -UserDataRoot $Root | Where-Object Key -eq 'Personal' }
+        $p | Should -Not -BeNullOrEmpty
+        $p.Directory | Should -Not -Be 'Default'
+        Get-Content -LiteralPath (Join-Path $p.Path 'Bookmarks') -Raw | Should -Be '{"roots":"A-Default"}'
+        # The store entry stays marked protected (sticky), although the copy on PC-B is a plain profile.
+        Set-TestFile -Path (Join-Path $p.Path 'Bookmarks') -Content '{"roots":"B-personal"}' -TimeUtc ([datetime]::UtcNow)
+        $r = Invoke-TestSync -Machine 'PC-B' -Extra @{ IncludeProtectedProfiles = $true; IncludeProfile = 'Personal' }
+        (Get-TestResult $r 'Personal' 'Bookmarks').Action | Should -Be 'Push'
+        $personal = Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Personal\profile.json') -Raw | ConvertFrom-Json -AsHashtable
+        $personal.Protected | Should -BeTrue
     }
 }

@@ -88,7 +88,7 @@ function Move-EdgeUserDataAside {
         [switch]$Force,
         [Parameter(Mandatory)][System.Management.Automation.PSCmdlet]$Cmdlet
     )
-    if ($Action -eq 'Merge' -or -not (Test-Path -LiteralPath $UserDataPath -PathType Container)) { return $null }
+    if ($Action -in 'Merge', 'Replace' -or -not (Test-Path -LiteralPath $UserDataPath -PathType Container)) { return $null }
     if ($Action -eq 'Remove' -and -not $Force -and -not $WhatIfPreference) {
         if (-not $Cmdlet.ShouldContinue("The existing Edge data in '$UserDataPath' (all profiles, passwords, cookies) will be DELETED after the restore. Continue?", 'Remove existing Edge User Data')) {
             Write-Warning 'Restore cancelled.'
@@ -239,4 +239,39 @@ function Import-EdgeRegistryFile {
     $ok = $LASTEXITCODE -eq 0
     $global:LASTEXITCODE = 0
     if (-not $ok) { Write-Warning "reg.exe import of '$Path' failed: $($out -join ' ')" }
+}
+
+function Clear-EdgeUnprotectedProfile {
+    <#
+    .SYNOPSIS
+        -ExistingDataAction Replace: moves every local profile that is not protected into
+        "<User Data>\EdgeProfileSync-replaced\<timestamp>\profiles\<Directory>" and unregisters it from
+        Local State. Protected profiles (Default, signed in) and Local State itself stay. Edge must be closed.
+        Returns the moved profiles.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Channel,
+        [Parameter(Mandatory)][string]$UserDataRoot,
+        [Parameter(Mandatory)][string]$Timestamp,
+        [switch]$IncludeProtectedProfiles,
+        [Parameter(Mandatory)][System.Management.Automation.PSCmdlet]$Cmdlet
+    )
+    $local = @(Get-EdgeLocalProfile -Channel $Channel -UserDataRoot $UserDataRoot)
+    $toMove = @($local | Where-Object { $IncludeProtectedProfiles -or -not (Test-EdgeProtectedProfile $_) } | Where-Object Directory -ne 'Default')
+    $keep = @($local | Where-Object { $_.Directory -notin @($toMove | ForEach-Object { $_.Directory }) })
+    if (-not $toMove) {
+        Write-EdgeNote 'Replace: no local profiles to move aside.' -Level Info
+        return
+    }
+    Write-EdgeNote ('Replace: moving {0} local profile(s) aside; keeping {1}.' -f $toMove.Count,
+        ($keep ? (($keep | ForEach-Object { "$($_.Name) ($($_.Directory))" }) -join ', ') : 'none')) -Level Info
+    $aside = Join-Path $UserDataRoot "EdgeProfileSync-replaced\$Timestamp\profiles"
+    foreach ($p in $toMove) {
+        if (-not $Cmdlet.ShouldProcess("$($p.Path) ('$($p.Name)')", 'Move profile aside (Replace)')) { continue }
+        Remove-EdgeLocalProfile -Directory $p.Directory -Channel $Channel -UserDataRoot $UserDataRoot -KeepFolder -Confirm:$false
+        Move-EdgeItemAside -Path $p.Path -BackupRoot $aside -WhatIf:$false -Confirm:$false
+        $p
+    }
+    Write-EdgeNote "Replace: the previous profiles are kept in '$aside' (delete it when everything works)."
 }

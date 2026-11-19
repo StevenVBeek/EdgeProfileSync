@@ -15,7 +15,9 @@ function Remove-EdgeProfile {
         machines does not re-create the profile.
 
         Edge of the channel must be fully closed (removing a profile rewrites Local State, which Edge
-        overwrites on exit); -CloseEdge stops it. The 'Default' profile cannot be removed.
+        overwrites on exit); -CloseEdge stops it. The 'Default' profile cannot be removed, and profiles
+        signed in with an account (protected profiles, typically the work profile) are skipped unless
+        -IncludeProtectedProfiles is given.
 
         Asks for confirmation per profile (ConfirmImpact High) unless -Force or -Confirm:$false.
 
@@ -45,6 +47,9 @@ function Remove-EdgeProfile {
 
     .PARAMETER CloseEdge
         Stop Edge of the channel if it is running.
+
+    .PARAMETER IncludeProtectedProfiles
+        Also remove profiles that are signed in with an account. The 'Default' profile is never removed.
 
     .PARAMETER Force
         Do not ask for confirmation.
@@ -89,6 +94,8 @@ function Remove-EdgeProfile {
         [switch]$LocalOnly,
 
         [switch]$CloseEdge,
+
+        [switch]$IncludeProtectedProfiles,
 
         [switch]$Force,
 
@@ -161,6 +168,11 @@ function Remove-EdgeProfile {
                 if ($p.Directory -eq 'Default') {
                     Write-Warning "The 'Default' profile ('$($p.Name)') cannot be removed (Edge recreates it); skipped."
                     & $addResult $p 'Skipped' 'Default profile' $null $false
+                    continue
+                }
+                if (-not $isOrphan -and -not $IncludeProtectedProfiles -and (Test-EdgeProtectedProfile $p)) {
+                    Write-Warning "Profile '$($p.Name)' ($($p.Directory)) is protected ($(Test-EdgeProtectedProfile $p -Reason)); skipped. Use -IncludeProtectedProfiles to remove it."
+                    & $addResult $p 'Skipped' 'Protected profile (signed in)' $null $false
                     continue
                 }
                 $label = $isOrphan ? "orphan folder '$($p.Directory)'" : "profile '$($p.Name)' ($($p.Directory))"

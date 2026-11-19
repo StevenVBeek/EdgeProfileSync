@@ -152,7 +152,8 @@ function Get-EdgePathSize {
             $opts = [System.IO.EnumerationOptions]::new()
             $opts.RecurseSubdirectories = $true
             $opts.IgnoreInaccessible = $true
-            $opts.AttributesToSkip = [System.IO.FileAttributes]::ReparsePoint
+            # Nothing is skipped: OneDrive cloud-only files are reparse points and must be counted and copied.
+            $opts.AttributesToSkip = [System.IO.FileAttributes]0
             foreach ($f in [System.IO.DirectoryInfo]::new($Path).EnumerateFiles('*', $opts)) { $sum += $f.Length }
             return $sum
         }

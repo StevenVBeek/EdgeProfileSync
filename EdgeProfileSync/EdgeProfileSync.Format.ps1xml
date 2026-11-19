@@ -19,6 +19,7 @@
           <TableColumnHeader><Label>Bookmarks</Label><Alignment>Right</Alignment></TableColumnHeader>
           <TableColumnHeader><Label>SizeMB</Label><Alignment>Right</Alignment></TableColumnHeader>
           <TableColumnHeader><Label>InUse</Label></TableColumnHeader>
+          <TableColumnHeader><Label>Protected</Label></TableColumnHeader>
         </TableHeaders>
         <TableRowEntries>
           <TableRowEntry>
@@ -30,6 +31,7 @@
               <TableColumnItem><PropertyName>BookmarkCount</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>SizeMB</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>InUse</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Protected</PropertyName></TableColumnItem>
             </TableColumnItems>
           </TableRowEntry>
         </TableRowEntries>

@@ -43,6 +43,10 @@ function Set-EdgeProfileSyncConfig {
         When a profile was removed on another machine with Remove-EdgeProfile, also remove it on this
         machine (to the Recycle Bin, only while Edge is fully closed). Default: $false.
 
+    .PARAMETER IncludeProtectedProfiles
+        Also sync protected profiles: the 'Default' profile and every profile signed in with an account.
+        Default: $false - Sync-EdgeProfiles then never pushes, pulls into, creates or removes them.
+
     .PARAMETER IntervalMinutes
         Repetition interval of the scheduled sync task. Re-run Register-EdgeProfileSyncTask -Force
         to apply a new interval to an existing task.
@@ -86,6 +90,8 @@ function Set-EdgeProfileSyncConfig {
         [bool]$CloseBackgroundEdge,
 
         [bool]$RemoveDeletedProfiles,
+
+        [bool]$IncludeProtectedProfiles,
 
         [ValidateRange(5, 1440)]
         [int]$IntervalMinutes,
@@ -157,6 +163,7 @@ function Set-EdgeProfileSyncConfig {
     if ($PSBoundParameters.ContainsKey('ArchiveRetention')) { $newConfig['ArchiveRetention'] = $ArchiveRetention }
     if ($PSBoundParameters.ContainsKey('CloseBackgroundEdge')) { $newConfig['CloseBackgroundEdge'] = $CloseBackgroundEdge }
     if ($PSBoundParameters.ContainsKey('RemoveDeletedProfiles')) { $newConfig['RemoveDeletedProfiles'] = $RemoveDeletedProfiles }
+    if ($PSBoundParameters.ContainsKey('IncludeProtectedProfiles')) { $newConfig['IncludeProtectedProfiles'] = $IncludeProtectedProfiles }
     if ($PSBoundParameters.ContainsKey('IntervalMinutes')) { $newConfig['IntervalMinutes'] = $IntervalMinutes }
 
     if ($PSCmdlet.ShouldProcess($path, 'Write EdgeProfileSync configuration')) {

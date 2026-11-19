@@ -15,6 +15,9 @@ function Get-EdgeProfileSyncConfig {
         - ExcludeProfiles     : profile names/keys to exclude (wildcards allowed).
         - ArchiveRetention    : versions kept per profile/category in the store archive (default 10).
         - CloseBackgroundEdge : allow stopping windowless (Startup Boost) Edge to apply changes (default $true).
+        - RemoveDeletedProfiles : remove profiles locally that were deleted on another machine (default $false).
+        - IncludeProtectedProfiles : also sync protected profiles - the 'Default' profile and every profile
+                                signed in with an account (default $false: they are never touched by sync).
         - IntervalMinutes     : repetition interval of the scheduled task (default 30).
 
         Unknown keys in the file are ignored. A corrupt file produces a warning and the defaults.
@@ -61,7 +64,7 @@ function Get-EdgeProfileSyncConfig {
                     { $_ -in 'ArchiveRetention', 'IntervalMinutes' } {
                         if ($null -ne $value) { $config[$key] = [int]$value }
                     }
-                    { $_ -in 'CloseBackgroundEdge', 'RemoveDeletedProfiles' } {
+                    { $_ -in 'CloseBackgroundEdge', 'RemoveDeletedProfiles', 'IncludeProtectedProfiles' } {
                         # JSON booleans arrive as [bool]; tolerate hand-edited "true"/"false" strings too.
                         if ($value -is [bool]) { $config[$key] = $value }
                         elseif ($null -ne $value) { $config[$key] = [string]$value -in 'true', '1', 'yes' }

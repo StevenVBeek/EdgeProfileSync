@@ -175,6 +175,43 @@ function New-EdgeLocalProfile {
     Get-EdgeLocalProfile -Channel $Channel -UserDataRoot $UserDataRoot | Where-Object Directory -eq $dir
 }
 
+function Test-EdgeProtectedProfile {
+    <#
+    .SYNOPSIS
+        $true for a profile that restore, sync and cleanup must leave alone unless -IncludeProtectedProfiles:
+        the 'Default' profile and every profile signed in with an account (typically the work profile,
+        which also has Edge's own sync and organisation policies).
+    .DESCRIPTION
+        Accepts a local profile object (Get-EdgeLocalProfile / Get-EdgeProfile: Directory, IsSignedIn,
+        InfoCache) or a backup/store profile entry (hashtable with Directory and InfoCache). Returns the
+        reason as a string with -Reason, else a bool.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)][AllowNull()][object]$InputObject,
+        [switch]$Reason
+    )
+    $get = {
+        param($o, [string]$name)
+        if ($null -eq $o) { return $null }
+        if ($o -is [System.Collections.IDictionary]) { return $o.Contains($name) ? $o[$name] : $null }
+        $prop = $o.PSObject.Properties[$name]
+        $prop ? $prop.Value : $null
+    }
+    $directory = [string](& $get $InputObject 'Directory')
+    $signedIn = & $get $InputObject 'IsSignedIn'
+    if ($null -eq $signedIn) {
+        $info = & $get $InputObject 'InfoCache'
+        $userName = [string](& $get $info 'user_name')
+        $signedIn = -not [string]::IsNullOrWhiteSpace($userName)
+    }
+    $why = if ($directory -eq 'Default') { 'Default profile' }
+    elseif ([bool]$signedIn) { 'signed in with an account' }
+    else { '' }
+    if ($Reason) { return $why }
+    [bool]$why
+}
+
 function Remove-EdgeLocalProfile {
     <#
     .SYNOPSIS

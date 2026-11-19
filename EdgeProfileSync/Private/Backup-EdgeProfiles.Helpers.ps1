@@ -68,7 +68,8 @@ function Get-EdgeDirectoryFile {
     $opts = [System.IO.EnumerationOptions]::new()
     $opts.RecurseSubdirectories = $true
     $opts.IgnoreInaccessible = $true
-    $opts.AttributesToSkip = [System.IO.FileAttributes]::ReparsePoint
+    # Nothing is skipped: OneDrive cloud-only files are reparse points and must be counted and copied.
+    $opts.AttributesToSkip = [System.IO.FileAttributes]0
     [System.IO.DirectoryInfo]::new($Path).EnumerateFiles('*', $opts)
 }
 

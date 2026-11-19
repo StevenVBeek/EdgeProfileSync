@@ -11,15 +11,16 @@ function Get-EdgeSyncDefaultConfig {
     $syncRoot = if ([string]::IsNullOrWhiteSpace($oneDrive)) { $null } else { Join-Path $oneDrive 'EdgeProfileSync' }
 
     [ordered]@{
-        SyncRoot            = $syncRoot
-        Channels            = @('Stable')
-        Categories          = @((Get-EdgeDataCategory -DefaultOnly).Name)
-        IncludeProfiles     = @()
-        ExcludeProfiles     = @()
-        ArchiveRetention    = 10
-        CloseBackgroundEdge = $true
-        RemoveDeletedProfiles = $false
-        IntervalMinutes     = 30
+        SyncRoot                 = $syncRoot
+        Channels                 = @('Stable')
+        Categories               = @((Get-EdgeDataCategory -DefaultOnly).Name)
+        IncludeProfiles          = @()
+        ExcludeProfiles          = @()
+        ArchiveRetention         = 10
+        CloseBackgroundEdge      = $true
+        RemoveDeletedProfiles    = $false
+        IncludeProtectedProfiles = $false
+        IntervalMinutes          = 30
     }
 }
 
