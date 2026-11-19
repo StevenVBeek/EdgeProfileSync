@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-11-19
+
+### Added
+
+- Detailed progress for `Backup-EdgeProfiles`, `Restore-EdgeProfiles`, `Sync-EdgeProfiles`,
+  `Remove-EdgeProfile` and `Get-EdgeProfile`: a header (source, target, Edge state), progress bars with
+  percentage, size, speed and remaining time, a line per profile and a summary. `Sync-EdgeProfiles -Quiet`
+  (the scheduled task) stays silent.
+- `Backup-EdgeProfiles -Format Folder`: a plain folder backup copied with robocopy, much faster for large
+  backups; with `-AddDate $false` it is updated incrementally. `Restore-EdgeProfiles` accepts such folders.
+
+### Changed
+
+- Zip backups no longer copy everything to a temporary folder first: files are read in place by several
+  threads and compressed by one writer. `-Category All` with extension binaries went from roughly half an
+  hour to 4.5 minutes on a machine with real-time antivirus.
+- Files that cannot be read during a backup (vanished, locked) are skipped and reported instead of
+  failing the whole backup. A failing channel no longer produces follow-up errors.
+
+### Fixed
+
+- Live `-journal` / `-shm` files of databases inside a directory (Collections) are no longer stored next
+  to their snapshot, where a stale journal could roll the snapshot back on open.
+- LevelDB `LOCK` files of open profiles are no longer reported as unreadable.
+
 ## [2.0.0] - 2026-11-19
 
 Complete rewrite as the `EdgeProfileSync` module (successor of `EDGEProfiles`).
