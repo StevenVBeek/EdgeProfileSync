@@ -1,12 +1,13 @@
 function Backup-EdgeProfiles {
     <#
     .SYNOPSIS
-        Creates a fast zip backup of the current user's Microsoft Edge profiles.
+        Creates a fast backup (zip or folder) of the current user's Microsoft Edge profiles.
 
     .DESCRIPTION
-        Copies only the selected data categories of each profile (bookmarks, settings, history,
-        collections, ... see Get-EdgeProfile / the module README) into a staging folder and zips it
-        with .NET ZipFile (compression level Fastest). Caches are never touched or deleted.
+        Backs up only the selected data categories of each profile (bookmarks, settings, history,
+        collections, ... see the module README). Files are read in place and written into the zip by
+        several reader threads (compression level Fastest); with -Format Folder they are copied with robocopy.
+        Caches are never touched or deleted. Progress is shown per profile, with sizes, speed and ETA.
 
         Archive layout:
             backup-manifest.json                     module version, machine id, channel, profiles
@@ -39,6 +40,13 @@ function Backup-EdgeProfiles {
         caches and other rebuildable data, like EDGEProfiles 1.x did. Only useful on the same machine
         and user account. Ignores -Category.
 
+    .PARAMETER Format
+        Zip (default): one zip archive per channel, Edge<Channel>-<yyyyMMdd-HHmmss>.zip.
+        Folder: a plain folder per channel, Edge<Channel>-<yyyyMMdd-HHmmss>, copied with robocopy. Much faster
+        for large backups (for example -Category All with extension binaries: tens of thousands of files, which
+        real-time antivirus scans one by one when they are zipped). With -AddDate $false the same folder
+        Edge<Channel> is updated every time and only changed files are copied. Restore-EdgeProfiles accepts both.
+
     .PARAMETER CloseEdge
         Stop Edge of the channel before the backup (open windows are closed!).
 
@@ -65,6 +73,12 @@ function Backup-EdgeProfiles {
 
     .EXAMPLE
         Backup-EdgeProfiles -Profile 'Work*' -Category Bookmarks -CloseEdge -PassThru
+
+    .EXAMPLE
+        Backup-EdgeProfiles -Category All -Format Folder -AddDate $false -Destination D:\EdgeBackup
+
+        Keeps one complete, incrementally updated folder backup (including extension binaries) in
+        D:\EdgeBackup\EdgeStable. Repeated runs only copy what changed.
     #>
     [CmdletBinding()]
     param(
@@ -80,6 +94,9 @@ function Backup-EdgeProfiles {
         [string[]]$Category,
 
         [switch]$Full,
+
+        [ValidateSet('Zip', 'Folder')]
+        [string]$Format = 'Zip',
 
         [switch]$CloseEdge,
 
@@ -139,13 +156,36 @@ function Backup-EdgeProfiles {
             continue
         }
 
-        $staging = Join-Path ([System.IO.Path]::GetTempPath()) "EdgeProfileSync-backup-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
-        $null = New-Item -ItemType Directory -Path $staging -Force
+        $timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $baseName = $AddDate ? "Edge$ch-$timestamp" : "Edge$ch"
+        $targetPath = Join-Path $Destination ($Format -eq 'Zip' ? "$baseName.zip" : $baseName)
+        $targetKind = $Format -eq 'Zip' ? 'zip archive' : ($AddDate ? 'folder' : 'folder, incremental: only changes are copied')
+        $categoryText = $Full ? 'full User Data, without caches' : "categories: $(@($categories | ForEach-Object { $_.Name }) -join ', ')"
+
+        Write-EdgeStatus ''
+        Write-EdgeStatus "Backup of Edge $ch ($categoryText)" -Level Header
+        Write-EdgeStatus "  Source      : $($info.UserDataPath)" -Level Header
+        Write-EdgeStatus "  Target      : $targetPath ($targetKind)" -Level Header
+        Write-EdgeStatus "  Profiles    : $($profiles.Count)$($ProfileName ? " (filter: $($ProfileName -join ', '))" : '')" -Level Header
+        Write-EdgeStatus ('  Edge        : {0}' -f ($edgeRunning ? "running ($($state.ProcessCount) processes) - databases are copied as consistent snapshots" : 'not running')) -Level Header
+
+        # Folder format: copy straight into the target folder. Zip format: a work folder holds only database
+        # snapshots and generated files (or the staging copy of -Full); everything else is read in place.
+        $work = Join-Path ([System.IO.Path]::GetTempPath()) "EdgeProfileSync-backup-$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+        $stageRoot = $Format -eq 'Folder' ? $targetPath : $work
+        $null = New-Item -ItemType Directory -Path $work -Force
+        $null = New-Item -ItemType Directory -Path $stageRoot -Force
+        $progress = $null
+        $tmpZip = $null
+        $skipped = @()
+        [long]$rawSize = 0
         try {
-            $channelStage = Join-Path $staging $ch
+            $channelStage = Join-Path $stageRoot $ch
             $manifestProfiles = [System.Collections.Generic.List[object]]::new()
+            $zipItems = [System.Collections.Generic.List[object]]::new()
 
             if ($Full) {
+                # ---------------------------------------------------------------- full User Data
                 $excludeDirs = [System.Collections.Generic.List[string]]::new()
                 $excludeDirs.AddRange([string[]]$script:EdgeFullBackupExcludeDirs)
                 if ($ProfileName) {
@@ -155,15 +195,24 @@ function Backup-EdgeProfiles {
                         if ($p.Directory -notin $selectedDirs) { $excludeDirs.Add($p.Path) }
                     }
                 }
-                Invoke-EdgeRobocopy -Source $info.UserDataPath -Destination (Join-Path $channelStage 'UserData') `
+                $progress = New-EdgeProgress -Activity "Backing up Edge $ch (full)" -Total ($profiles.Count + 1) -Unit Steps
+                Update-EdgeProgress -Progress $progress -Status 'Copying User Data without caches (robocopy)' -Force
+                Write-EdgeStatus 'Copying User Data without caches (robocopy)...'
+                $roboSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $userDataStage = Join-Path $channelStage 'UserData'
+                Invoke-EdgeRobocopy -Source $info.UserDataPath -Destination $userDataStage `
                     -ExcludeDirectory $excludeDirs -ExcludeFile $script:EdgeFullBackupExcludeFiles
+                Write-EdgeStatus ('  copied {0} in {1}' -f (Format-EdgeSize (Get-EdgePathSize -Path $userDataStage)), (Format-EdgeDuration $roboSw.Elapsed)) -Level Step
+                $pi = 0
                 foreach ($p in $profiles) {
+                    $pi++
+                    Update-EdgeProgress -Progress $progress -Done $pi -Status "Database snapshots: profile $pi/$($profiles.Count) '$($p.Name)'"
                     # Re-copy the known SQLite databases as consistent snapshots (Edge may be running).
                     foreach ($cat in @(Get-EdgeDataCategory | Where-Object Sqlite)) {
                         foreach ($f in $cat.Files) {
                             $src = Join-Path $p.Path $f
                             if (Test-Path -LiteralPath $src -PathType Leaf) {
-                                try { Copy-EdgeSqliteSnapshot -Source $src -Destination (Join-Path $channelStage "UserData\$($p.Directory)\$f") }
+                                try { Copy-EdgeSqliteSnapshot -Source $src -Destination (Join-Path $userDataStage "$($p.Directory)\$f") }
                                 catch { Write-EdgeSyncLog -Message "Snapshot of '$src' failed: $($_.Exception.Message)" -Level Warning }
                             }
                         }
@@ -172,34 +221,98 @@ function Backup-EdgeProfiles {
                             Name = $p.Name; Key = $p.Key; Directory = $p.Directory; InfoCache = $p.InfoCache; Categories = @()
                         })
                 }
+                Complete-EdgeProgress -Progress $progress
+                $progress = $null
+                if ($Format -eq 'Zip') {
+                    foreach ($f in @(Get-EdgeDirectoryFile -Path $userDataStage)) {
+                        $zipItems.Add([pscustomobject]@{
+                                Source = $f.FullName
+                                Entry  = ([System.IO.Path]::GetRelativePath($work, $f.FullName)).Replace('\', '/')
+                                Bytes  = $f.Length
+                            })
+                    }
+                }
             }
             else {
+                # ---------------------------------------------------------------- scan
+                $scan = New-EdgeProgress -Activity "Backing up Edge $ch - scanning" -Total $profiles.Count -Unit Steps
+                $plan = [System.Collections.Generic.List[object]]::new()
+                $pi = 0
                 foreach ($p in $profiles) {
+                    $pi++
+                    Update-EdgeProgress -Progress $scan -Done ($pi - 1) -Status "Measuring profile $pi/$($profiles.Count) '$($p.Name)'"
+                    $sizes = [ordered]@{}
+                    foreach ($cat in $categories) { $sizes[$cat.Name] = Get-EdgeCategorySize -ProfilePath $p.Path -Category $cat }
+                    $plan.Add([pscustomobject]@{ Profile = $p; Sizes = $sizes; Bytes = [long]($sizes.Values | Measure-Object -Sum).Sum })
+                }
+                Complete-EdgeProgress -Progress $scan
+                [long]$planned = ($plan | Measure-Object -Property Bytes -Sum).Sum
+                $largest = (@($plan | Sort-Object Bytes -Descending | Select-Object -First 3) | ForEach-Object { "$($_.Profile.Name) ($(Format-EdgeSize $_.Bytes))" }) -join ', '
+                Write-EdgeStatus ('Scanned {0} profile(s): {1} to back up. Largest: {2}' -f $profiles.Count, (Format-EdgeSize $planned), $largest)
+                $bigCats = foreach ($cat in $categories) {
+                    [long]$catTotal = ($plan | ForEach-Object { $_.Sizes[$cat.Name] } | Measure-Object -Sum).Sum
+                    if ($catTotal -ge 100MB) { "$($cat.Name) $(Format-EdgeSize $catTotal)" }
+                }
+                if ($bigCats) { Write-EdgeStatus "  Large categories: $($bigCats -join ', ')" -Level Step }
+
+                # ---------------------------------------------------------------- per profile
+                $activity = $Format -eq 'Zip' ? "Backing up Edge $ch - collecting files" : "Backing up Edge $ch"
+                $progress = New-EdgeProgress -Activity $activity -Total $planned
+                $pi = 0
+                foreach ($item in $plan) {
+                    $p = $item.Profile
+                    $pi++
+                    $profileSw = [System.Diagnostics.Stopwatch]::StartNew()
                     $done = [System.Collections.Generic.List[string]]::new()
+                    $failed = [System.Collections.Generic.List[string]]::new()
+                    [long]$profileFiles = 0
                     foreach ($cat in $categories) {
-                        $catStage = Join-Path $channelStage (Join-Path $p.Key $cat.Name)
+                        $catBytes = [long]$item.Sizes[$cat.Name]
+                        Update-EdgeProgress -Progress $progress -Status "Profile $pi/$($profiles.Count) '$($p.Name)'" `
+                            -CurrentOperation ('{0} ({1})' -f $cat.Name, (Format-EdgeSize $catBytes)) -Force
                         try {
-                            if (Copy-EdgeCategoryToStage -ProfilePath $p.Path -Category $cat -StagePath $catStage) {
+                            if ($Format -eq 'Zip') {
+                                $catItems = @(Get-EdgeCategoryZipItem -ProfilePath $p.Path -Category $cat -EntryPrefix "$ch/$($p.Key)/$($cat.Name)" -WorkDir $work)
+                                if ($catItems.Count) {
+                                    $zipItems.AddRange([object[]]$catItems)
+                                    $done.Add($cat.Name)
+                                    $profileFiles += $catItems.Count
+                                }
+                            }
+                            elseif (Copy-EdgeCategoryToStage -ProfilePath $p.Path -Category $cat -StagePath (Join-Path $channelStage (Join-Path $p.Key $cat.Name))) {
                                 $done.Add($cat.Name)
                             }
                         }
                         catch {
+                            $failed.Add($cat.Name)
                             Write-EdgeSyncLog -Message "Backup Edge $ch '$($p.Key)' $($cat.Name) failed: $($_.Exception.Message)" -Level Warning
                         }
+                        Update-EdgeProgress -Progress $progress -Add $catBytes
                     }
+                    $filesText = $Format -eq 'Zip' ? (' in {0:N0} file(s)' -f $profileFiles) : ''
+                    $line = '[{0,3}/{1}] {2}: {3} categor{4}, {5}{6}, {7}' -f $pi, $profiles.Count, $p.Name, $done.Count,
+                        ($done.Count -eq 1 ? 'y' : 'ies'), (Format-EdgeSize $item.Bytes), $filesText, (Format-EdgeDuration $profileSw.Elapsed)
+                    if ($failed.Count) { Write-EdgeStatus "$line - FAILED: $($failed -join ', ') (see log)" -Level Warning }
+                    else { Write-EdgeStatus $line -Level Step }
                     $manifestProfiles.Add([ordered]@{
                             Name = $p.Name; Key = $p.Key; Directory = $p.Directory; InfoCache = $p.InfoCache; Categories = @($done)
                         })
                 }
+                Complete-EdgeProgress -Progress $progress
+                $progress = $null
             }
 
-            # --- registry (PreferenceMACs); skipped when a test User Data root is used
+            # ---------------------------------------------------------------- registry + manifest
             $registryEntry = $null
             if (-not $UserDataRoot -and $info.RegistryKey) {
-                $regFile = Join-Path $staging 'registry\PreferenceMACs.reg'
-                if (Export-EdgeRegistryKey -Key $info.RegistryKey -Path $regFile) { $registryEntry = 'registry/PreferenceMACs.reg' }
+                $regFile = Join-Path $stageRoot 'registry\PreferenceMACs.reg'
+                if (Export-EdgeRegistryKey -Key $info.RegistryKey -Path $regFile) {
+                    $registryEntry = 'registry/PreferenceMACs.reg'
+                    if ($Format -eq 'Zip') {
+                        $zipItems.Add([pscustomobject]@{ Source = $regFile; Entry = $registryEntry; Bytes = (Get-Item -LiteralPath $regFile).Length })
+                    }
+                }
             }
-
             $manifest = [ordered]@{
                 FormatVersion  = 2
                 ModuleVersion  = $moduleVersion
@@ -213,52 +326,80 @@ function Backup-EdgeProfiles {
                 Registry       = $registryEntry
                 Profiles       = @($manifestProfiles)
             }
-            Write-EdgeJsonFile -Path (Join-Path $staging 'backup-manifest.json') -InputObject $manifest
+            $manifestFile = Join-Path $stageRoot 'backup-manifest.json'
+            Write-EdgeJsonFile -Path $manifestFile -InputObject $manifest
 
-            [long]$rawSize = (Get-ChildItem -LiteralPath $staging -File -Recurse -Force | Measure-Object -Property Length -Sum).Sum
-
-            # --- zip
-            $zipName = $AddDate ? "Edge$ch-$((Get-Date).ToString('yyyyMMdd-HHmmss')).zip" : "Edge$ch.zip"
-            $zipPath = Join-Path $Destination $zipName
-            $tmpZip = "$zipPath.tmp"
-            if (Test-Path -LiteralPath $tmpZip) { Remove-Item -LiteralPath $tmpZip -Force }
-            [System.IO.Compression.ZipFile]::CreateFromDirectory($staging, $tmpZip, [System.IO.Compression.CompressionLevel]::Fastest, $false)
-            Move-Item -LiteralPath $tmpZip -Destination $zipPath -Force
+            if ($Format -eq 'Zip') {
+                $zipItems.Add([pscustomobject]@{ Source = $manifestFile; Entry = 'backup-manifest.json'; Bytes = (Get-Item -LiteralPath $manifestFile).Length })
+                $rawSize = ($zipItems | Measure-Object -Property Bytes -Sum).Sum
+                $zipName = Split-Path $targetPath -Leaf
+                if ($zipItems.Count -ge 10000) {
+                    Write-EdgeStatus ('{0:N0} files to compress. With real-time antivirus every file is scanned when it is opened, so this can take minutes; -Format Folder (robocopy) is much faster for backups this size.' -f $zipItems.Count) -Level Warning
+                }
+                $tmpZip = "$targetPath.tmp"
+                if (Test-Path -LiteralPath $tmpZip) { Remove-Item -LiteralPath $tmpZip -Force }
+                Write-EdgeStatus ('Compressing {0:N0} file(s), {1}, into {2}...' -f $zipItems.Count, (Format-EdgeSize $rawSize), $zipName)
+                $zipSw = [System.Diagnostics.Stopwatch]::StartNew()
+                $skipped = @(Write-EdgeZipFromList -Items $zipItems.ToArray() -ZipPath $tmpZip -Activity "Backing up Edge $ch - compressing $zipName" -ProgressId 1)
+                Write-EdgeStatus ('  compressed in {0}' -f (Format-EdgeDuration $zipSw.Elapsed)) -Level Step
+                foreach ($s in $skipped) {
+                    Write-EdgeStatus "  Skipped (could not be read): $($s.Entry) - $($s.Reason)" -Level Warning -Log
+                }
+                Move-Item -LiteralPath $tmpZip -Destination $targetPath -Force
+            }
+            else {
+                $rawSize = Get-EdgePathSize -Path $targetPath
+            }
+        }
+        catch {
+            # A failure here leaves no usable backup for this channel: report it and go on with the next one.
+            Write-EdgeStatus "Backup of Edge $ch FAILED: $($_.Exception.Message)" -Level Warning -Log
+            if ($tmpZip -and (Test-Path -LiteralPath $tmpZip)) { Remove-Item -LiteralPath $tmpZip -Force -ErrorAction Ignore }
+            Write-Error -ErrorRecord $_ -ErrorAction Continue
+            continue
         }
         finally {
-            Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction Ignore
+            if ($progress) { Complete-EdgeProgress -Progress $progress }
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction Ignore
         }
 
-        # --- retention
+        # ---------------------------------------------------------------- retention
         if ($Retention -gt 0) {
-            $pattern = "^Edge$ch-\d{8}-\d{6}\.zip$"
-            Get-ChildItem -LiteralPath $Destination -Filter "Edge$ch-*.zip" -File |
+            $isZip = $Format -eq 'Zip'
+            $pattern = $isZip ? "^Edge$ch-\d{8}-\d{6}\.zip$" : "^Edge$ch-\d{8}-\d{6}$"
+            Get-ChildItem -LiteralPath $Destination -Filter ($isZip ? "Edge$ch-*.zip" : "Edge$ch-*") -File:$isZip -Directory:(-not $isZip) |
                 Where-Object Name -Match $pattern |
                 Sort-Object Name -Descending |
                 Select-Object -Skip $Retention |
                 ForEach-Object {
-                    Write-Verbose "Retention: removing $($_.FullName)"
-                    Remove-Item -LiteralPath $_.FullName -Force
+                    Write-EdgeStatus "Retention: removing old backup $($_.Name)" -Level Step
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force
                 }
         }
 
         $sw.Stop()
-        $zipItem = Get-Item -LiteralPath $zipPath
-        $summary = 'Edge {0} backup: {1} profile(s), {2:N1} MB data -> {3:N1} MB zip in {4:N1} s: {5}' -f `
-            $ch, $profiles.Count, ($rawSize / 1MB), ($zipItem.Length / 1MB), $sw.Elapsed.TotalSeconds, $zipPath
-        Write-Host $summary
+        [long]$outBytes = $Format -eq 'Zip' ? (Get-Item -LiteralPath $targetPath).Length : $rawSize
+        $summary = 'Edge {0} backup: {1} profile(s), {2:N1} MB data -> {3:N1} MB {4} in {5:N1} s: {6}' -f `
+            $ch, $profiles.Count, ($rawSize / 1MB), ($outBytes / 1MB), $Format.ToLowerInvariant(), $sw.Elapsed.TotalSeconds, $targetPath
         Write-EdgeSyncLog -Message $summary -Level Info
+        Write-EdgeStatus ('Backup of Edge {0} finished in {1}' -f $ch, (Format-EdgeDuration $sw.Elapsed)) -Level Success
+        Write-EdgeStatus ('  Profiles : {0}' -f $profiles.Count) -Level Success
+        Write-EdgeStatus ('  Data     : {0}{1}' -f (Format-EdgeSize $rawSize), ($Format -eq 'Zip' ? " -> zip $(Format-EdgeSize $outBytes)" : '')) -Level Success
+        if ($skipped.Count) { Write-EdgeStatus ('  Skipped  : {0} file(s) that could not be read (see above)' -f $skipped.Count) -Level Warning }
+        Write-EdgeStatus ('  {0,-9}: {1}' -f ($Format -eq 'Zip' ? 'File' : 'Folder'), $targetPath) -Level Success
 
         if ($PassThru) {
             [pscustomobject]@{
-                Channel    = $ch
-                Path       = $zipPath
-                Profiles   = $profiles.Count
-                Categories = $Full ? @('Full') : @($categories | ForEach-Object { $_.Name })
-                DataBytes  = $rawSize
-                ZipBytes   = $zipItem.Length
-                Duration   = $sw.Elapsed
-                MachineId  = $machineId
+                Channel      = $ch
+                Path         = $targetPath
+                Format       = $Format
+                Profiles     = $profiles.Count
+                Categories   = $Full ? @('Full') : @($categories | ForEach-Object { $_.Name })
+                DataBytes    = $rawSize
+                ZipBytes     = $Format -eq 'Zip' ? $outBytes : $null
+                SkippedFiles = $skipped.Count
+                Duration     = $sw.Elapsed
+                MachineId    = $machineId
             }
         }
     }

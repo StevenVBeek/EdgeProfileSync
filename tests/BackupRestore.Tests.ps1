@@ -226,6 +226,67 @@ Describe 'Backup and restore' {
             ($names -match 'Cache|Login Data|EncryptedBookmarks2|Extensions/') | Should -BeNullOrEmpty
         }
 
+        It 'leaves live journals and LevelDB LOCK files out of the zip' {
+            $pp = Join-Path $script:UD 'Profile 1'
+            Set-Content (Join-Path $pp 'Collections\collectionsSQLite-journal') 'stale' -NoNewline
+            Set-Content (Join-Path $pp "Local Extension Settings\$($script:IdEdge)\LOCK") '' -NoNewline
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
+            $names = Get-ZipEntryName $r.Path
+            $names | Should -Contain 'Stable/Work/Collections/Collections/collectionsSQLite'
+            ($names -match '-journal$') | Should -BeNullOrEmpty
+            ($names -match '/LOCK$') | Should -BeNullOrEmpty
+            $r.SkippedFiles | Should -Be 0
+        }
+
+        It '-Format Folder writes the same layout as a folder, updates it incrementally and restores from it' {
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -Format Folder -AddDate $false -PassThru
+            $r.Format | Should -Be 'Folder'
+            $r.Path | Should -Be (Join-Path $script:Dest 'EdgeStable')
+            Join-Path $r.Path 'backup-manifest.json' | Should -Exist
+            Join-Path $r.Path 'Stable\Work\Bookmarks\Bookmarks' | Should -Exist
+            Join-Path $r.Path 'Stable\Work\Collections\Collections\collectionsSQLite' | Should -Exist
+
+            # second run into the same folder picks up a change
+            Set-Content (Join-Path $script:UD 'Profile 1\Bookmarks') 'changed' -NoNewline
+            $r2 = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -Format Folder -AddDate $false -PassThru
+            $r2.Path | Should -Be $r.Path
+            Get-Content (Join-Path $r.Path 'Stable\Work\Bookmarks\Bookmarks') -Raw | Should -Be 'changed'
+
+            # restore from the folder; the folder itself stays intact
+            Set-Content (Join-Path $script:UD 'Profile 1\Bookmarks') 'local' -NoNewline
+            $null = Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -Category Bookmarks -ProfileName Work
+            Get-Content (Join-Path $script:UD 'Profile 1\Bookmarks') -Raw | Should -Be 'changed'
+            Join-Path $r.Path 'Stable\Work\Bookmarks\Bookmarks' | Should -Exist
+            Join-Path $r.Path 'backup-manifest.json' | Should -Exist
+        }
+
+        It '-Format Folder retention removes old timestamped folders only' {
+            $null = New-Item -ItemType Directory -Path (Join-Path $script:Dest 'EdgeStable-20200101-000000') -Force
+            $null = New-Item -ItemType Directory -Path (Join-Path $script:Dest 'EdgeStable-20200102-000000') -Force
+            $null = New-Item -ItemType Directory -Path (Join-Path $script:Dest 'Other') -Force
+            $null = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -Format Folder -Retention 2
+            @(Get-ChildItem $script:Dest -Directory -Filter 'EdgeStable-*').Count | Should -Be 2
+            Join-Path $script:Dest 'EdgeStable-20200101-000000' | Should -Not -Exist
+            Join-Path $script:Dest 'Other' | Should -Exist
+        }
+
+        It 'reports unreadable files as skipped instead of failing the backup' {
+            InModuleScope EdgeProfileSync {
+                Initialize-EdgeZipWriter
+                $dir = Join-Path $TestDrive 'zw'; $null = New-Item -ItemType Directory $dir -Force
+                Set-Content (Join-Path $dir 'a.txt') 'aaa' -NoNewline
+                $items = @(
+                    [pscustomobject]@{ Source = (Join-Path $dir 'a.txt'); Entry = 'a.txt'; Bytes = 3 }
+                    [pscustomobject]@{ Source = (Join-Path $dir 'missing.txt'); Entry = 'missing.txt'; Bytes = 1 }
+                )
+                $skipped = @(Write-EdgeZipFromList -Items $items -ZipPath (Join-Path $dir 'out.zip'))
+                $skipped.Count | Should -Be 1
+                $skipped[0].Entry | Should -Be 'missing.txt'
+                $z = [IO.Compression.ZipFile]::OpenRead((Join-Path $dir 'out.zip'))
+                try { @($z.Entries.FullName) | Should -Be @('a.txt') } finally { $z.Dispose() }
+            }
+        }
+
         It 'writes a manifest with machine id and profiles' {
             $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
             $tmp = Join-Path $TestDrive 'mf'; Remove-Item $tmp -Recurse -Force -ErrorAction Ignore
@@ -490,6 +551,53 @@ Describe 'Backup and restore' {
             $res[0].Action | Should -Be 'Removed'
             $orphan | Should -Not -Exist
             @(Get-EdgeProfile -UserDataRoot $script:UD).Count | Should -Be 2
+        }
+    }
+
+    Context 'Progress and status output' {
+        BeforeAll {
+            # Tests always pass -Permanent: never use the real Recycle Bin.
+            Mock -ModuleName EdgeProfileSync Remove-EdgeLocalProfile -ParameterFilter { -not $Permanent } { throw 'tests must use -Permanent' }
+        }
+        AfterEach {
+            InModuleScope EdgeProfileSync { $script:EdgeQuiet = $false }
+        }
+
+        It 'status lines go to the host only; the success stream carries just the result objects' {
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
+
+            $out = @(Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD)
+            $out.Count | Should -Be 0
+            $res = @(Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -PassThru)
+            $res.Count | Should -BeGreaterThan 0
+            foreach ($o in $res) { $o.PSObject.Properties.Name | Should -Contain 'Action' }
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match '\[1/2\] Personal -> Default: \d+ categories restored' }
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match 'Restore of Edge Stable finished' }
+
+            $profiles = @(Get-EdgeProfile -UserDataRoot $script:UD -IncludeSize -SyncRoot (Join-Path $TestDrive 'nosync'))
+            $profiles.Count | Should -Be 2
+            foreach ($p in $profiles) { $p.PSObject.TypeNames | Should -Contain 'EdgeProfileSync.Profile' }
+
+            $removed = @(Remove-EdgeProfile -Name Work -UserDataRoot $script:UD -SkipBackup -LocalOnly -Permanent -Force)
+            $removed.Count | Should -Be 0
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match "\[1/1\] Removed 'Work' \(Profile 1\)" }
+            Join-Path $script:UD 'Profile 1' | Should -Not -Exist
+        }
+
+        It 'Get-EdgeProfile writes no console lines' {
+            $null = Get-EdgeProfile -UserDataRoot $script:UD -IncludeSize -All -SyncRoot (Join-Path $TestDrive 'nosync')
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -Times 0 -Exactly
+        }
+
+        It '$script:EdgeQuiet suppresses all host output' {
+            InModuleScope EdgeProfileSync { $script:EdgeQuiet = $true }
+            $r = Backup-EdgeProfiles -UserDataRoot $script:UD -Destination $script:Dest -PassThru
+            $res = @(Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -PassThru)
+            ($res | Where-Object Action -eq 'Restored').Count | Should -BeGreaterThan 0
+            $rm = @(Remove-EdgeProfile -Name Work -UserDataRoot $script:UD -BackupDestination $script:Dest -LocalOnly -Permanent -Force -PassThru)
+            $rm[0].Action | Should -Be 'Removed'
+            $null = Get-EdgeProfile -UserDataRoot $script:UD -IncludeSize
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -Times 0 -Exactly
         }
     }
 

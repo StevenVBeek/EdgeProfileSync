@@ -1,6 +1,6 @@
 @{
     RootModule           = 'EdgeProfileSync.psm1'
-    ModuleVersion        = '2.0.0'
+    ModuleVersion        = '2.1.0'
     CompatiblePSEditions = @('Core')
     GUID                 = '1bd59bae-471a-4f90-b06e-12045f6c6c53'
     Author               = 'Steven van Beek (based on EdgeProfiles by Michael Mardahl)'
@@ -31,6 +31,10 @@
             LicenseUri   = 'https://github.com/StevenVBeek/EdgeProfileSync/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/StevenVBeek/EdgeProfileSync'
             ReleaseNotes = @'
+2.1.0 - detailed progress (header, progress bars with speed and ETA, per-profile lines, summary) for backup,
+restore, sync and cleanup; Backup-EdgeProfiles -Format Folder (robocopy, incremental); faster zip backups
+(parallel readers, no temporary copy); unreadable files are skipped and reported instead of failing.
+
 2.0.0 - complete rewrite of EDGEProfiles (by Michael Mardahl / MSEndpointMgr) for PowerShell 7.4+.
 - Fast: copies a whitelist of profile files instead of zipping the whole User Data folder.
 - Works with Edge open: consistent SQLite snapshots for export; import into profiles that are not open.

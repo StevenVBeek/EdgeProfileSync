@@ -22,7 +22,7 @@ long time, and it emptied cache folders in the live profile first.
 
 v2 copies only a **whitelist of files per profile** (see the table below), typically tens of MB per
 profile instead of gigabytes, uses `robocopy` for folders and .NET `ZipFile` for archives, and never
-touches the caches of the live profile. A backup of two dozen profiles takes about 20 seconds,
+touches the caches of the live profile. A backup of two dozen profiles takes about 15 seconds,
 with Edge open.
 
 On top of that, v2 adds two-way sync between machines and a scheduled task that runs it in the background.
@@ -144,6 +144,10 @@ Backup-EdgeProfiles -Category Bookmarks, Settings -AddDate $false
 # Everything, including extension binaries and autofill data
 Backup-EdgeProfiles -Category All
 
+# Large backups: a plain folder (robocopy) instead of a zip - much faster with antivirus,
+# and with -AddDate $false the same folder is updated incrementally (only changes are copied)
+Backup-EdgeProfiles -Category All -Format Folder -AddDate $false -Destination D:\EdgeBackup
+
 # A full copy of User Data minus caches (like 1.x, but much smaller and faster)
 Backup-EdgeProfiles -Full -Destination D:\EdgeBackup
 
@@ -153,11 +157,34 @@ Backup-EdgeProfiles -Retention 5
 # Get the result object (path, size, duration) for scripting
 $backup = Backup-EdgeProfiles -PassThru
 $backup.Path
+
+# Silence the progress bars (status lines go to the host and can be dropped with 6>$null)
+$ProgressPreference = 'SilentlyContinue'
+Backup-EdgeProfiles 6>$null
 ```
+
+Backup, restore, sync and cleanup show what they are doing: a header with source, target and Edge
+state, a progress bar with percentage, size, speed and remaining time, one line per profile and a
+summary at the end. The scheduled task runs `Sync-EdgeProfiles -Quiet`, which only writes the log.
+
+**How long does a backup take?** Measured with 24 profiles, Edge open, real-time antivirus on:
+
+| Backup | Size | Time |
+|---|---|---|
+| Default categories, zip | 435 MB in 440 files | 15 s |
+| `-Category All`, zip (extension binaries: 39,000 files) | 2.65 GB | 4.5 min |
+| `-Category All -Format Folder` | 2.65 GB | 1 min |
+| `-Category All -Format Folder -AddDate $false`, second run | only changes | 18 s |
+
+Antivirus scans every file the first time it is opened, which makes zipping tens of thousands of small
+extension files slow; robocopy (`-Format Folder`) is not affected the same way.
 
 ### Restore
 
 ```powershell
+# Restore from a folder backup (made with -Format Folder) works the same way
+Restore-EdgeProfiles -Path D:\EdgeBackup\EdgeStable
+
 # Restore everything from a backup into the existing profiles (files that are replaced are kept
 # in "User Data\EdgeProfileSync-replaced\<timestamp>")
 Restore-EdgeProfiles -Path D:\EdgeBackup\EdgeStable-20261119-101500.zip

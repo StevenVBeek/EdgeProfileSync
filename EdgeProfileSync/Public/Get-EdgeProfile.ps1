@@ -66,44 +66,53 @@ function Get-EdgeProfile {
         $profiles = @(Get-EdgeLocalProfile -Channel $ch -UserDataRoot $UserDataRoot)
         if ($All) { $profiles += @(Get-EdgeOrphanProfile -UserDataPath $info.UserDataPath -Channel $ch -Registered $profiles) }
 
-        foreach ($p in (Select-EdgeProfileByFilter -InputObject $profiles -Filter $Name)) {
-            $isOrphan = [bool]($p.PSObject.Properties['IsOrphan'] -and $p.IsOrphan)
-            $lastActiveUtc = $p.PSObject.Properties['LastActiveUtc'] ? $p.LastActiveUtc : $null
+        $selected = @(Select-EdgeProfileByFilter -InputObject $profiles -Filter $Name)
+        $activity = $IncludeSize ? "Reading Edge $ch profiles (with folder sizes)" : "Reading Edge $ch profiles"
+        $progress = New-EdgeProgress -Activity $activity -Total $selected.Count -Unit Steps -Id 30
+        try {
+            $index = 0
+            foreach ($p in $selected) {
+                $index++
+                Update-EdgeProgress -Progress $progress -Done ($index - 1) -Status ("Reading profile {0}/{1} '{2}'" -f $index, $selected.Count, $p.Name) -CurrentOperation $p.Directory -Force
+                $isOrphan = [bool]($p.PSObject.Properties['IsOrphan'] -and $p.IsOrphan)
+                $lastActiveUtc = $p.PSObject.Properties['LastActiveUtc'] ? $p.LastActiveUtc : $null
 
-            $syncState = ''
-            if ($storeExists -and -not $isOrphan) {
-                # Tombstone written by Remove-EdgeProfile / the sync engine: store\<Channel>\<Key>\deleted.json
-                $storeDir = Join-Path $syncRootPath "store\$ch\$($p.Key)"
-                $syncState = if (Test-Path -LiteralPath (Join-Path $storeDir 'deleted.json') -PathType Leaf) { 'Deleted elsewhere' }
-                elseif (Test-Path -LiteralPath $storeDir -PathType Container) { 'Synced' }
-                else { 'LocalOnly' }
-            }
+                $syncState = ''
+                if ($storeExists -and -not $isOrphan) {
+                    # Tombstone written by Remove-EdgeProfile / the sync engine: store\<Channel>\<Key>\deleted.json
+                    $storeDir = Join-Path $syncRootPath "store\$ch\$($p.Key)"
+                    $syncState = if (Test-Path -LiteralPath (Join-Path $storeDir 'deleted.json') -PathType Leaf) { 'Deleted elsewhere' }
+                    elseif (Test-Path -LiteralPath $storeDir -PathType Container) { 'Synced' }
+                    else { 'LocalOnly' }
+                }
 
-            $out = [ordered]@{
-                PSTypeName        = 'EdgeProfileSync.Profile'
-                Channel           = $ch
-                Directory         = $p.Directory
-                Name              = $p.Name
-                Key               = $p.Key
-                Account           = $p.PSObject.Properties['Account'] ? [string]$p.Account : ''
-                IsSignedIn        = [bool]$p.IsSignedIn
-                LastActiveUtc     = $lastActiveUtc
-                LastActive        = $lastActiveUtc ? ([datetime]$lastActiveUtc).ToLocalTime() : $null
-                InUse             = Test-EdgeProfileInUse -Path $p.Path
-                BookmarkCount     = Get-EdgeBookmarkCount -Path (Join-Path $p.Path 'Bookmarks')
-                ExtensionCount    = @(Get-EdgeExtensionInventory -ProfilePath $p.Path -WarningAction SilentlyContinue).Count
-                PendingExtensions = $isOrphan ? 0 : @(Get-EdgePendingExtension -Channel $ch -ProfileKey $p.Key).Count
-                SizeMB            = $null
-                SyncState         = $syncState
-                IsOrphan          = $isOrphan
-                Path              = $p.Path
+                $out = [ordered]@{
+                    PSTypeName        = 'EdgeProfileSync.Profile'
+                    Channel           = $ch
+                    Directory         = $p.Directory
+                    Name              = $p.Name
+                    Key               = $p.Key
+                    Account           = $p.PSObject.Properties['Account'] ? [string]$p.Account : ''
+                    IsSignedIn        = [bool]$p.IsSignedIn
+                    LastActiveUtc     = $lastActiveUtc
+                    LastActive        = $lastActiveUtc ? ([datetime]$lastActiveUtc).ToLocalTime() : $null
+                    InUse             = Test-EdgeProfileInUse -Path $p.Path
+                    BookmarkCount     = Get-EdgeBookmarkCount -Path (Join-Path $p.Path 'Bookmarks')
+                    ExtensionCount    = @(Get-EdgeExtensionInventory -ProfilePath $p.Path -WarningAction SilentlyContinue).Count
+                    PendingExtensions = $isOrphan ? 0 : @(Get-EdgePendingExtension -Channel $ch -ProfileKey $p.Key).Count
+                    SizeMB            = $null
+                    SyncState         = $syncState
+                    IsOrphan          = $isOrphan
+                    Path              = $p.Path
+                }
+                if ($IncludeSize) {
+                    Update-EdgeProgress -Progress $progress -Status ("Reading profile {0}/{1} '{2}' - measuring folder size" -f $index, $selected.Count, $p.Name) -CurrentOperation $p.Path -Force
+                    $bytes = [long](Get-EdgePathSize -Path $p.Path)
+                    $out.SizeMB = [math]::Round($bytes / 1MB, 1)
+                }
+                [pscustomobject]$out
             }
-            if ($IncludeSize) {
-                $bytes = [long](Get-ChildItem -LiteralPath $p.Path -File -Recurse -Force -ErrorAction Ignore |
-                    Measure-Object -Property Length -Sum).Sum
-                $out.SizeMB = [math]::Round($bytes / 1MB, 1)
-            }
-            [pscustomobject]$out
         }
+        finally { Complete-EdgeProgress -Progress $progress }
     }
 }

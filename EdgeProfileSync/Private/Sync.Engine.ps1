@@ -296,6 +296,44 @@ function Get-EdgeSyncExtensionDataId {
     @($ids)
 }
 
+# --- Progress helpers --------------------------------------------------------------------------
+
+# Copies of at least this many bytes get their own (child) progress bar.
+$script:EdgeSyncCopyProgressMinBytes = 1MB
+
+function Set-EdgeSyncContextValue {
+    # Internal: sets a property of a run / profile context when it has that property (StrictMode-safe;
+    # contexts built by tests or older callers may not carry the progress / statistics fields).
+    param([AllowNull()][object]$InputObject, [string]$Name, [AllowNull()][object]$Value)
+    if ($null -ne $InputObject -and $InputObject.PSObject.Properties[$Name]) { $InputObject.$Name = $Value }
+}
+
+function Set-EdgeSyncItemPhase {
+    <#
+    .SYNOPSIS
+        Shows the phase of the current sync item ("comparing", "pushing", "pulling") on the run's
+        progress bar, when the run context has one (Context.Progress / Context.ProgressLabel).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Context,
+        [Parameter(Mandatory)][string]$Phase,
+        [switch]$Force
+    )
+    $progress = Get-EdgeSyncValue $Context 'Progress'
+    if ($null -eq $progress) { return }
+    $label = [string](Get-EdgeSyncValue $Context 'ProgressLabel')
+    Update-EdgeProgress -Progress $progress -Status $(if ($label) { '{0}: {1}' -f $label, $Phase } else { $Phase }) -Force:$Force
+}
+
+function New-EdgeSyncCopyProgress {
+    # Internal: child progress bar (Id = ParentId + 1) for a byte copy; $null when there is no parent bar
+    # or the copy is too small to be worth a bar.
+    param([long]$Total, [string]$Activity, [int]$ParentId = -1)
+    if ($ParentId -lt 0 -or $Total -lt $script:EdgeSyncCopyProgressMinBytes) { return $null }
+    New-EdgeProgress -Activity $Activity -Total $Total -Unit Bytes -Id ($ParentId + 1) -ParentId $ParentId
+}
+
 # --- Executors -------------------------------------------------------------------------------
 
 function Invoke-EdgeSyncPush {
@@ -307,6 +345,10 @@ function Invoke-EdgeSyncPush {
         Item spec of the local side (Get-EdgeSyncItemSpec). Ignored with -GeneratedName.
     .PARAMETER GeneratedName
         File name for generated content (ExtensionList: extensions.json) written from -GeneratedContent.
+    .PARAMETER ProgressParentId
+        Id of the run's progress bar; large copies then show a child bar with bytes, speed and ETA.
+    .PARAMETER Stats
+        Optional hashtable; receives Bytes = the number of bytes copied into the store.
     #>
     [CmdletBinding()]
     param(
@@ -319,21 +361,31 @@ function Invoke-EdgeSyncPush {
         [AllowNull()][AllowEmptyString()][string]$PreviousMachine,
         [Parameter(Mandatory)][int]$ArchiveRetention,
         [Nullable[datetime]]$LocalLastWriteUtc,
-        [switch]$Sqlite
+        [switch]$Sqlite,
+        [int]$ProgressParentId = -1,
+        [hashtable]$Stats
     )
 
     $tmp = '{0}.tmp-{1}' -f $StoreItemPath, (ConvertTo-EdgeSafeName -Name $MachineId)
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction Stop }
     $null = New-Item -Path $tmp -ItemType Directory -Force
 
+    $copyProgress = $null
     try {
         if ($GeneratedName) {
             $bytes = [Text.UTF8Encoding]::new($false).GetBytes($GeneratedContent)
             [IO.File]::WriteAllBytes((Join-Path $tmp $GeneratedName), $bytes)
             $fingerprint = Get-EdgeSyncSha256 -Bytes $bytes
+            if ($null -ne $Stats) { $Stats.Bytes = [long]$bytes.Length }
         }
         else {
+            $sizes = @{}
+            [long]$total = 0
+            foreach ($item in @($LocalItems)) { $sizes[$item.Name] = Get-EdgePathSize -Path $item.Path; $total += $sizes[$item.Name] }
+            if ($null -ne $Stats) { $Stats.Bytes = $total }
+            $copyProgress = New-EdgeSyncCopyProgress -Total $total -Activity ('Pushing {0} to the sync store' -f (Split-Path -Path $StoreItemPath -Leaf)) -ParentId $ProgressParentId
             foreach ($item in @($LocalItems)) {
+                if ($copyProgress) { Update-EdgeProgress -Progress $copyProgress -Status "Copying $($item.Name)" -CurrentOperation $item.Path -Force }
                 $dest = Join-Path $tmp $item.Name
                 if ($item.IsDirectory) {
                     if (Test-Path -LiteralPath $item.Path -PathType Container) {
@@ -352,6 +404,7 @@ function Invoke-EdgeSyncPush {
                     if ($Sqlite) { Copy-EdgeSqliteSnapshot -Source $item.Path -Destination $dest }
                     else { Copy-EdgeItem -Source $item.Path -Destination $dest }
                 }
+                if ($copyProgress) { Update-EdgeProgress -Progress $copyProgress -Status "Copied $($item.Name)" -Add $sizes[$item.Name] }
             }
             # Fingerprint of what actually landed in the store (the local file may change during the copy).
             $fingerprint = Get-EdgeSyncFingerprint -Items @(Get-EdgeSyncItemSpec -Root $tmp -Category ([pscustomobject]@{
@@ -366,6 +419,9 @@ function Invoke-EdgeSyncPush {
     catch {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
         throw
+    }
+    finally {
+        if ($copyProgress) { Complete-EdgeProgress -Progress $copyProgress }
     }
 
     $now = [datetime]::UtcNow
@@ -386,6 +442,8 @@ function Invoke-EdgeSyncPull {
         -MoveLocalAside (conflict pull): the current local parts are moved to -ReplacedPath first.
         MoveAsideOnRestore files of the category (e.g. EncryptedBookmarks2) are always moved aside.
         Local parts that do not exist in the store copy are left alone (deletions are not propagated).
+        -ProgressParentId: id of the run's progress bar (large copies get a child bar). -Stats receives
+        Bytes = the number of bytes copied into the profile.
     #>
     [CmdletBinding()]
     param(
@@ -394,42 +452,63 @@ function Invoke-EdgeSyncPull {
         [Parameter(Mandatory)][string]$StoreItemPath,
         [Parameter(Mandatory)][string]$ProfilePath,
         [Parameter(Mandatory)][string]$ReplacedPath,
-        [switch]$MoveLocalAside
+        [switch]$MoveLocalAside,
+        [int]$ProgressParentId = -1,
+        [hashtable]$Stats
     )
 
     if (-not (Test-Path -LiteralPath $StoreItemPath -PathType Container)) { throw "Store copy '$StoreItemPath' does not exist." }
 
-    if ($MoveLocalAside) {
-        foreach ($item in @($LocalItems)) {
-            if (Test-Path -LiteralPath $item.Path) {
-                $backupRoot = if ($item.IsDirectory -and $item.Path -ne (Join-Path $ProfilePath $item.Name)) { Join-Path $ReplacedPath $item.Name } else { $ReplacedPath }
-                Move-EdgeItemAside -Path $item.Path -BackupRoot $backupRoot -Confirm:$false
-            }
-        }
-    }
-    foreach ($name in @($Category.MoveAsideOnRestore)) {
-        if (-not $name) { continue }
-        $p = Join-Path $ProfilePath $name
-        if (Test-Path -LiteralPath $p) { Move-EdgeItemAside -Path $p -BackupRoot $ReplacedPath -Confirm:$false }
-    }
-
+    $sizes = @{}
+    [long]$total = 0
     foreach ($item in @($LocalItems)) {
         $src = Join-Path $StoreItemPath $item.Name
-        if ($item.IsDirectory) {
-            if (Test-Path -LiteralPath $src -PathType Container) { Copy-EdgeItem -Source $src -Destination $item.Path -Directory }
-        }
-        elseif (Test-Path -LiteralPath $src -PathType Leaf) {
-            if ($Category.Sqlite) {
-                # A stale local write-ahead log / journal must never be applied to the restored database.
-                foreach ($suffix in '-wal', '-journal', '-shm') {
-                    if (Test-Path -LiteralPath "$($item.Path)$suffix") { Move-EdgeItemAside -Path "$($item.Path)$suffix" -BackupRoot $ReplacedPath -Confirm:$false }
+        $size = Get-EdgePathSize -Path $src
+        if ($Category.Sqlite -and -not $item.IsDirectory) { $size += Get-EdgePathSize -Path "$src-wal" }
+        $sizes[$item.Name] = $size
+        $total += $size
+    }
+    if ($null -ne $Stats) { $Stats.Bytes = $total }
+    $copyProgress = New-EdgeSyncCopyProgress -Total $total -Activity ('Pulling {0} from the sync store' -f (Split-Path -Path $StoreItemPath -Leaf)) -ParentId $ProgressParentId
+    try {
+
+        if ($MoveLocalAside) {
+            foreach ($item in @($LocalItems)) {
+                if (Test-Path -LiteralPath $item.Path) {
+                    $backupRoot = if ($item.IsDirectory -and $item.Path -ne (Join-Path $ProfilePath $item.Name)) { Join-Path $ReplacedPath $item.Name } else { $ReplacedPath }
+                    Move-EdgeItemAside -Path $item.Path -BackupRoot $backupRoot -Confirm:$false
                 }
             }
-            Copy-EdgeItem -Source $src -Destination $item.Path
-            if ($Category.Sqlite -and (Test-Path -LiteralPath "$src-wal" -PathType Leaf)) {
-                Copy-EdgeItem -Source "$src-wal" -Destination "$($item.Path)-wal"
-            }
         }
+        foreach ($name in @($Category.MoveAsideOnRestore)) {
+            if (-not $name) { continue }
+            $p = Join-Path $ProfilePath $name
+            if (Test-Path -LiteralPath $p) { Move-EdgeItemAside -Path $p -BackupRoot $ReplacedPath -Confirm:$false }
+        }
+
+        foreach ($item in @($LocalItems)) {
+            $src = Join-Path $StoreItemPath $item.Name
+            if ($copyProgress) { Update-EdgeProgress -Progress $copyProgress -Status "Copying $($item.Name)" -CurrentOperation $item.Path -Force }
+            if ($item.IsDirectory) {
+                if (Test-Path -LiteralPath $src -PathType Container) { Copy-EdgeItem -Source $src -Destination $item.Path -Directory }
+            }
+            elseif (Test-Path -LiteralPath $src -PathType Leaf) {
+                if ($Category.Sqlite) {
+                    # A stale local write-ahead log / journal must never be applied to the restored database.
+                    foreach ($suffix in '-wal', '-journal', '-shm') {
+                        if (Test-Path -LiteralPath "$($item.Path)$suffix") { Move-EdgeItemAside -Path "$($item.Path)$suffix" -BackupRoot $ReplacedPath -Confirm:$false }
+                    }
+                }
+                Copy-EdgeItem -Source $src -Destination $item.Path
+                if ($Category.Sqlite -and (Test-Path -LiteralPath "$src-wal" -PathType Leaf)) {
+                    Copy-EdgeItem -Source "$src-wal" -Destination "$($item.Path)-wal"
+                }
+            }
+            if ($copyProgress) { Update-EdgeProgress -Progress $copyProgress -Status "Copied $($item.Name)" -Add $sizes[$item.Name] }
+        }
+    }
+    finally {
+        if ($copyProgress) { Complete-EdgeProgress -Progress $copyProgress }
     }
 }
 
@@ -457,7 +536,10 @@ function Confirm-EdgeSyncChannelClosed {
         if ($Context.Cmdlet.ShouldProcess("Microsoft Edge $channel (background, no windows)", 'Stop process')) {
             $stopped = [bool](Stop-EdgeProcess -Channel $channel -BackgroundOnly)
             $gate.Closed = $stopped
-            if ($stopped) { Write-EdgeSyncEvent "Stopped windowless (background) Edge $channel to apply changes." }
+            if ($stopped) {
+                Write-EdgeSyncEvent "Stopped windowless (background) Edge $channel to apply changes."
+                Write-EdgeStatus "Stopped windowless (background) Edge $channel to apply pulled data." -Level Info
+            }
             else { $gate.Reason = "Edge $channel is running and could not be stopped; will retry next run." }
         }
         else {
@@ -474,7 +556,10 @@ function Confirm-EdgeSyncChannelClosed {
         $gate.Closed = $false
         $gate.Reason = "Edge $channel is running with open windows; will retry next run."
     }
-    if (-not $gate.Closed -and $gate.Reason) { Write-EdgeSyncEvent $gate.Reason }
+    if (-not $gate.Closed -and $gate.Reason) {
+        Write-EdgeSyncEvent $gate.Reason
+        Write-EdgeStatus $gate.Reason -Level Warning
+    }
     [bool]$gate.Closed
 }
 
@@ -524,8 +609,11 @@ function Invoke-EdgeSyncItem {
     .PARAMETER Context
         Run context built by Sync-EdgeProfiles (Cmdlet, Channel, MachineId, LocalDataPath, RunStamp,
         State, Mode, AllowLiveCopy, CloseBackgroundEdge, ArchiveRetention, Gate, WhatIf).
+        Optional progress fields: Progress (tracker of the run's bar), ProgressLabel, ProgressId.
     .PARAMETER ProfileContext
         Key, Profile (local profile object), Location (store/archive paths), Manifest, Inventory, PushedAny.
+        Optional statistics fields (set when present): LastBytes (bytes copied for this item),
+        PendingExtensions (extensions listed in the store but not installed locally).
     #>
     [CmdletBinding()]
     param(
@@ -538,6 +626,9 @@ function Invoke-EdgeSyncItem {
     $ctx = $Context
     $p = $ProfileContext
     $itemName = if ($ExtensionId) { '{0}:{1}' -f $Category.Name, $ExtensionId } else { $Category.Name }
+    Set-EdgeSyncContextValue $p 'LastBytes' ([long]0)
+    $progressId = if ($null -ne (Get-EdgeSyncValue $ctx 'Progress')) { [int](Get-EdgeSyncValue $ctx 'ProgressId' 1) } else { -1 }
+    Set-EdgeSyncItemPhase -Context $ctx -Phase 'comparing'
     $newResult = {
         param([string]$Action, [string]$Reason)
         [pscustomobject]@{ Channel = $ctx.Channel; Profile = $p.Key; Category = $itemName; Action = $Action; Reason = $Reason }
@@ -601,7 +692,8 @@ function Invoke-EdgeSyncItem {
         if ($isGenerated -and -not $ctx.WhatIf) {
             $storeFile = Join-Path $storeItemPath $Category.Generated
             if (Test-Path -LiteralPath $storeFile -PathType Leaf) {
-                $null = Update-EdgeSyncPendingExtension -Channel $ctx.Channel -ProfileKey $p.Key -StoreList @(Read-EdgeSyncExtensionList -Path $storeFile) -LocalInventory $inventory
+                $pendingNow = @(Update-EdgeSyncPendingExtension -Channel $ctx.Channel -ProfileKey $p.Key -StoreList @(Read-EdgeSyncExtensionList -Path $storeFile) -LocalInventory $inventory)
+                Set-EdgeSyncContextValue $p 'PendingExtensions' $pendingNow
             }
         }
     }
@@ -652,7 +744,12 @@ function Invoke-EdgeSyncItem {
                 $pushArgs.LocalItems = $localItems
                 $pushArgs.Sqlite = [bool]$Category.Sqlite
             }
+            $copyStats = @{ Bytes = [long]0 }
+            $pushArgs.Stats = $copyStats
+            $pushArgs.ProgressParentId = $progressId
+            Set-EdgeSyncItemPhase -Context $ctx -Phase $(if ($decision -eq 'Conflict-Push') { 'pushing (conflict, local copy is newer)' } else { 'pushing' }) -Force
             $newEntry = Invoke-EdgeSyncPush @pushArgs
+            Set-EdgeSyncContextValue $p 'LastBytes' ([long]$copyStats.Bytes)
             $p.Manifest = Set-EdgeSyncManifestEntry -StoreProfilePath $p.Location.Store -Name $itemName -Entry $newEntry
             Set-EdgeSyncStateItem -State $ctx.State -ItemKey $stateKey -Fingerprint $newEntry.Fingerprint -LocalFingerprint $L
             $p.PushedAny = $true
@@ -689,7 +786,10 @@ function Invoke-EdgeSyncItem {
             $newL = $L
             if (-not $isGenerated) {
                 $replaced = Join-Path (Join-Path (Join-Path $ctx.LocalDataPath 'replaced') $ctx.RunStamp) $p.Profile.Directory
-                Invoke-EdgeSyncPull -Category $Category -LocalItems $localItems -StoreItemPath $storeItemPath -ProfilePath $profilePath -ReplacedPath $replaced -MoveLocalAside:($decision -eq 'Conflict-Pull')
+                $copyStats = @{ Bytes = [long]0 }
+                Set-EdgeSyncItemPhase -Context $ctx -Phase $(if ($decision -eq 'Conflict-Pull') { 'pulling (conflict, store copy is newer)' } else { 'pulling' }) -Force
+                Invoke-EdgeSyncPull -Category $Category -LocalItems $localItems -StoreItemPath $storeItemPath -ProfilePath $profilePath -ReplacedPath $replaced -MoveLocalAside:($decision -eq 'Conflict-Pull') -ProgressParentId $progressId -Stats $copyStats
+                Set-EdgeSyncContextValue $p 'LastBytes' ([long]$copyStats.Bytes)
                 $newL = Get-EdgeSyncFingerprint -Items $localItems
             }
             Set-EdgeSyncStateItem -State $ctx.State -ItemKey $stateKey -Fingerprint $R -LocalFingerprint $newL
