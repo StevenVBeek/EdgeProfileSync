@@ -1,5 +1,58 @@
 # Internal helpers for Restore-EdgeProfiles (not exported).
 
+function Expand-EdgeZipToDirectory {
+    <#
+    .SYNOPSIS
+        Extracts a zip entry by entry with a byte-based progress bar (equivalent to
+        ZipFile.ExtractToDirectory, including the path traversal check). Returns a summary object
+        (Files, Bytes, IsV2 = the zip contains backup-manifest.json, Duration).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$Destination,
+        [int]$ProgressId = 1,
+        [string]$Activity = 'Extracting backup'
+    )
+    $root = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    $null = [System.IO.Directory]::CreateDirectory($root)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $progress = $null
+    try {
+        $entries = @($zip.Entries)
+        [long]$total = 0
+        foreach ($e in $entries) { $total += $e.Length }
+        $isV2 = $null -ne $zip.GetEntry('backup-manifest.json')
+        $progress = New-EdgeProgress -Activity $Activity -Total $total -Id $ProgressId
+        $files = 0
+        $i = 0
+        foreach ($e in $entries) {
+            $i++
+            $dest = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $e.FullName))
+            if (-not $dest.StartsWith("$root\", [System.StringComparison]::OrdinalIgnoreCase) -and $dest -ne $root) {
+                throw "Zip entry '$($e.FullName)' would extract outside the destination folder."
+            }
+            if (-not $e.Name) {
+                # directory entry
+                $null = [System.IO.Directory]::CreateDirectory($dest)
+                continue
+            }
+            Update-EdgeProgress -Progress $progress -Status ('File {0} of {1}' -f $i, $entries.Count) -CurrentOperation $e.FullName
+            $null = [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($dest))
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $true)
+            $files++
+            Update-EdgeProgress -Progress $progress -Add $e.Length
+        }
+        $sw.Stop()
+        [pscustomobject]@{ Files = $files; Bytes = $total; IsV2 = $isV2; Duration = $sw.Elapsed }
+    }
+    finally {
+        $zip.Dispose()
+        if ($progress) { Complete-EdgeProgress -Progress $progress }
+    }
+}
+
 function Assert-EdgeRestoreAllowed {
     # Stops Edge when -CloseEdge. Returns $true when Edge of the channel is (still) running.
     # With -RequireClosed a running Edge is an error (under -WhatIf only a warning).
@@ -166,12 +219,12 @@ function Update-EdgePendingFromBackup {
     $pending = @($missing) + @($previous)
 
     if ($missing) {
-        Write-Host "Profile '$ProfileName': $($missing.Count) extension(s) from the backup are not installed:"
+        Write-EdgeStatus "      Profile '$ProfileName': $($missing.Count) extension(s) from the backup are not installed:" -Level Warning
         foreach ($m in $missing) {
             $where = $m.StoreUrl ? $m.StoreUrl : "($($m.Source): not available in a store, install manually)"
-            Write-Host "  - $($m.Name) [$($m.Id)] $where"
+            Write-EdgeStatus "        - $($m.Name) [$($m.Id)] $where" -Level Step
         }
-        Write-Host "  Run 'Install-EdgeProfileExtension -Profile ""$ProfileKey""' to open the store pages; their data is applied once installed."
+        Write-EdgeStatus "        Run 'Install-EdgeProfileExtension -Profile ""$ProfileKey""' to open the store pages; their data is applied once installed." -Level Step
     }
     if ($Cmdlet.ShouldProcess("$Channel\$ProfileKey", 'Update pending extension list')) {
         Set-EdgePendingExtension -Channel $Channel -ProfileKey $ProfileKey -Extension $pending -WhatIf:$false -Confirm:$false

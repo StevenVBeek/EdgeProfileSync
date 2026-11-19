@@ -124,6 +124,7 @@ function Remove-EdgeProfile {
 
         foreach ($chGroup in ($requests | Group-Object Channel)) {
             $ch = $chGroup.Name
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $info = Get-EdgeChannelInfo -Channel $ch -UserDataRoot $UserDataRoot
             $local = @(Get-EdgeLocalProfile -Channel $ch -UserDataRoot $UserDataRoot)
             $all = $local + @(Get-EdgeOrphanProfile -UserDataPath $info.UserDataPath -Channel $ch -Registered $local)
@@ -146,6 +147,12 @@ function Remove-EdgeProfile {
                         Action = $action; Reason = $reason; BackupPath = $backup; Tombstone = [bool]$tomb
                     })
             }
+            if (-not $selected.Count) { continue }
+
+            $how = $Permanent ? 'delete permanently' : 'move to the Recycle Bin'
+            Write-EdgeStatus ''
+            Write-EdgeStatus ('Remove {0} Edge {1} profile(s) ({2}{3})' -f $selected.Count, $ch, $how,
+                ($WhatIfPreference ? '; WhatIf: nothing is changed' : '')) -Level Header
 
             # Confirm per profile.
             $confirmed = [System.Collections.Generic.List[object]]::new()
@@ -157,11 +164,14 @@ function Remove-EdgeProfile {
                     continue
                 }
                 $label = $isOrphan ? "orphan folder '$($p.Directory)'" : "profile '$($p.Name)' ($($p.Directory))"
-                $how = $Permanent ? 'delete permanently' : 'move to the Recycle Bin'
                 if ($PSCmdlet.ShouldProcess("Edge $ch $label", "Remove profile ($how)")) { $confirmed.Add($p) }
-                else { & $addResult $p ($WhatIfPreference ? 'WhatIf' : 'Skipped') 'Not confirmed' $null $false }
+                else {
+                    & $addResult $p ($WhatIfPreference ? 'WhatIf' : 'Skipped') 'Not confirmed' $null $false
+                    if (-not $WhatIfPreference) { Write-EdgeStatus "Skipped $label - not confirmed." -Level Warning }
+                }
             }
 
+            $backupPath = $null
             if ($confirmed.Count) {
                 # Edge must be fully closed.
                 $state = Get-EdgeProcessState -Channel $ch
@@ -169,11 +179,11 @@ function Remove-EdgeProfile {
                     if (-not $CloseEdge) {
                         throw "Edge $ch is running. Removing profiles rewrites Local State, so Edge must be fully closed (also check the system tray / Startup Boost), or use -CloseEdge."
                     }
+                    Write-EdgeStatus "Stopping Edge $ch..." -Level Step
                     if (-not (Stop-EdgeProcess -Channel $ch)) { throw "Edge $ch could not be stopped; nothing removed." }
                 }
 
                 # Backup first (registered profiles; orphan folders are not in Local State and cannot be backed up by key).
-                $backupPath = $null
                 $toBackup = @($confirmed | Where-Object { -not ($_.PSObject.Properties['IsOrphan'] -and $_.IsOrphan) })
                 if (-not $SkipBackup -and $toBackup) {
                     $bArgs = @{
@@ -184,43 +194,69 @@ function Remove-EdgeProfile {
                     }
                     if ($BackupDestination) { $bArgs.Destination = $BackupDestination }
                     if ($UserDataRoot) { $bArgs.UserDataRoot = $UserDataRoot }
+                    $bSw = [System.Diagnostics.Stopwatch]::StartNew()
+                    Write-EdgeStatus "Backing up $($toBackup.Count) profile(s) before removal: $(($toBackup | ForEach-Object { $_.Name }) -join ', ')..." -Level Step
                     try { $backupPath = (Backup-EdgeProfiles @bArgs -ErrorAction Stop).Path }
                     catch { throw "Backup before removal failed, nothing removed: $($_.Exception.Message)" }
                     if (-not $backupPath) { throw 'Backup before removal produced no archive; nothing removed.' }
+                    Write-EdgeStatus ('Backup written: {0} ({1}, {2}).' -f $backupPath, (Format-EdgeSize (Get-EdgePathSize -Path $backupPath)), (Format-EdgeDuration $bSw.Elapsed)) -Level Success
                 }
+                elseif ($SkipBackup) { Write-EdgeStatus 'No backup is made (-SkipBackup).' -Level Warning }
 
                 $syncRootPath = $LocalOnly ? $null : (Get-EdgeBackupSyncRoot -SyncRoot $SyncRoot)
                 $canTombstone = $syncRootPath -and (Test-Path -LiteralPath (Join-Path $syncRootPath 'store') -PathType Container) -and
                     (Get-Command -Name Set-EdgeSyncTombstone -ErrorAction Ignore)
 
-                foreach ($p in $confirmed) {
-                    $isOrphan = [bool]($p.PSObject.Properties['IsOrphan'] -and $p.IsOrphan)
-                    try {
-                        Remove-EdgeLocalProfile -Directory $p.Directory -Channel $ch -UserDataRoot $UserDataRoot -Permanent:$Permanent -Confirm:$false -WhatIf:$false
-                    }
-                    catch {
-                        Write-EdgeSyncLog -Message "Removing Edge $ch profile '$($p.Name)' ($($p.Directory)) failed: $($_.Exception.Message)" -Level Warning
-                        & $addResult $p 'Error' $_.Exception.Message $backupPath $false
-                        continue
-                    }
-                    $tomb = $false
-                    if ($canTombstone -and -not $isOrphan) {
+                $progress = New-EdgeProgress -Activity "Removing Edge $ch profiles" -Total $confirmed.Count -Unit Steps -Id 20
+                try {
+                    $width = "$($confirmed.Count)".Length
+                    $i = 0
+                    foreach ($p in $confirmed) {
+                        $i++
+                        $isOrphan = [bool]($p.PSObject.Properties['IsOrphan'] -and $p.IsOrphan)
+                        $tag = "[{0,$width}/{1}]" -f $i, $confirmed.Count
+                        $label = $isOrphan ? "orphan folder '$($p.Directory)'" : "'$($p.Name)' ($($p.Directory))"
+                        Update-EdgeProgress -Progress $progress -Done ($i - 1) -Status "Profile $i/$($confirmed.Count) '$($p.Name)'" -CurrentOperation $p.Path -Force
+                        $pSw = [System.Diagnostics.Stopwatch]::StartNew()
+                        $size = Get-EdgePathSize -Path $p.Path
+                        Write-EdgeStatus "$tag Removing $label ($(Format-EdgeSize $size))..." -Level Step
                         try {
-                            Set-EdgeSyncTombstone -SyncRoot $syncRootPath -Channel $ch -ProfileKey $p.Key -Name $p.Name
-                            $tomb = $true
+                            Remove-EdgeLocalProfile -Directory $p.Directory -Channel $ch -UserDataRoot $UserDataRoot -Permanent:$Permanent -Confirm:$false -WhatIf:$false
                         }
-                        catch { Write-EdgeSyncLog -Message "Tombstone for '$($p.Key)' failed: $($_.Exception.Message)" -Level Warning }
+                        catch {
+                            Write-EdgeSyncLog -Message "Removing Edge $ch profile '$($p.Name)' ($($p.Directory)) failed: $($_.Exception.Message)" -Level Warning
+                            Write-EdgeStatus "$tag Failed to remove ${label}: $($_.Exception.Message)" -Level Warning
+                            & $addResult $p 'Error' $_.Exception.Message $backupPath $false
+                            continue
+                        }
+                        $tomb = $false
+                        if ($canTombstone -and -not $isOrphan) {
+                            try {
+                                Set-EdgeSyncTombstone -SyncRoot $syncRootPath -Channel $ch -ProfileKey $p.Key -Name $p.Name
+                                $tomb = $true
+                            }
+                            catch { Write-EdgeSyncLog -Message "Tombstone for '$($p.Key)' failed: $($_.Exception.Message)" -Level Warning }
+                        }
+                        Write-EdgeSyncLog -Message "Removed Edge $ch profile '$($p.Name)' ($($p.Directory))$($Permanent ? ' permanently' : ' to the Recycle Bin')$($backupPath ? "; backup: $backupPath" : '')." -Level Info
+                        $tombNote = $isOrphan ? '' : ($tomb ? '; tombstone written to the sync store' : ($LocalOnly ? '; local only (no tombstone)' : '; no sync store (no tombstone)'))
+                        Write-EdgeStatus ('{0} Removed {1}: {2} {3} in {4}{5}.' -f $tag, $label, (Format-EdgeSize $size),
+                            ($Permanent ? 'deleted permanently' : 'moved to the Recycle Bin'), (Format-EdgeDuration $pSw.Elapsed), $tombNote) -Level Success
+                        & $addResult $p 'Removed' $null $backupPath $tomb
+                        Update-EdgeProgress -Progress $progress -Done $i
                     }
-                    Write-EdgeSyncLog -Message "Removed Edge $ch profile '$($p.Name)' ($($p.Directory))$($Permanent ? ' permanently' : ' to the Recycle Bin')$($backupPath ? "; backup: $backupPath" : '')." -Level Info
-                    & $addResult $p 'Removed' $null $backupPath $tomb
                 }
+                finally { Complete-EdgeProgress -Progress $progress }
             }
 
+            $sw.Stop()
             $removed = @($results | Where-Object Action -eq 'Removed')
-            if ($removed) {
-                $where = $Permanent ? 'deleted' : 'moved to the Recycle Bin'
-                Write-Host "Edge ${ch}: $($removed.Count) profile(s) removed ($where)$($removed[0].BackupPath ? "; backup: $($removed[0].BackupPath)" : '')."
-            }
+            $skipped = @($results | Where-Object Action -in 'Skipped', 'WhatIf')
+            $failed = @($results | Where-Object Action -eq 'Error')
+            $where = $Permanent ? 'deleted' : 'moved to the Recycle Bin'
+            $level = $failed ? 'Warning' : 'Success'
+            Write-EdgeStatus ('Remove of Edge {0} profiles finished in {1}' -f $ch, (Format-EdgeDuration $sw.Elapsed)) -Level $level
+            Write-EdgeStatus ('  Profiles : {0} removed ({1}), {2} skipped, {3} failed' -f $removed.Count, $where, $skipped.Count, $failed.Count) -Level $level
+            if ($backupPath) { Write-EdgeStatus "  Backup   : $backupPath" -Level $level }
             if ($PassThru) { $results }
         }
     }

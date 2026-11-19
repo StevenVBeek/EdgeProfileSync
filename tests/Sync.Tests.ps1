@@ -585,6 +585,60 @@ Describe 'Sync-EdgeProfiles between two machines' {
         Should -Invoke -ModuleName EdgeProfileSync Remove-EdgeLocalProfile -Times 1 -Exactly -Scope It
     }
 
+    It '-Quiet writes nothing to the host and returns nothing' {
+        Set-TestFile -Path (Join-Path $script:WorkB 'Bookmarks') -Content '{"roots":"B-quiet"}' -TimeUtc ([datetime]::UtcNow)
+        $env:EPS_TEST_MACHINE = 'PC-B'
+        $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-B']
+        $out = @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-B'] -Quiet -WarningAction SilentlyContinue 6>&1)
+        $out.Count | Should -Be 0
+        # The change was still synced, and quiet mode does not leak into later runs.
+        Get-Content -LiteralPath (Join-Path $script:SyncRoot 'store\Stable\Work\Bookmarks\Bookmarks') -Raw | Should -Be '{"roots":"B-quiet"}'
+        InModuleScope EdgeProfileSync { $script:EdgeQuiet } | Should -BeFalse
+    }
+
+    It 'an interactive run writes status lines for push and pull; result objects are unchanged' {
+        $splitOutput = {
+            param([object[]]$Out)
+            $info = @($Out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
+            $objects = @($Out | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
+            [pscustomobject]@{ Info = $info; Objects = $objects }
+        }
+
+        Set-TestFile -Path (Join-Path $script:WorkB 'Bookmarks') -Content '{"roots":"B-status"}' -TimeUtc ([datetime]::UtcNow)
+        $env:EPS_TEST_MACHINE = 'PC-B'
+        $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-B']
+        $b = & $splitOutput @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-B'] -WarningAction SilentlyContinue 6>&1)
+
+        $env:EPS_TEST_MACHINE = 'PC-A'
+        $env:EDGEPROFILESYNC_HOME = $script:Homes['PC-A']
+        $a = & $splitOutput @(Sync-EdgeProfiles -SyncRoot $script:SyncRoot -Channel Stable -UserDataRoot $script:UserData['PC-A'] -WarningAction SilentlyContinue 6>&1)
+
+        # Result objects: only the five documented properties, nothing else on the success stream.
+        foreach ($set in $b.Objects, $a.Objects) {
+            $set.Count | Should -BeGreaterThan 0
+            foreach ($o in $set) {
+                $o | Should -BeOfType [pscustomobject]
+                @($o.PSObject.Properties.Name) | Should -Be @('Channel', 'Profile', 'Category', 'Action', 'Reason')
+            }
+        }
+        (Get-TestResult $b.Objects 'Work' 'Bookmarks').Action | Should -BeIn @('Push', 'Conflict-Push')
+        (Get-TestResult $a.Objects 'Work' 'Bookmarks').Action | Should -BeIn @('Pull', 'Conflict-Pull')
+
+        # Status lines: header, per-item line, compact profile line, summary.
+        $b.Info | Should -Contain 'Edge profile sync'
+        ($b.Info -join "`n") | Should -Match 'Machine\s+: PC-B'
+        ($b.Info -join "`n") | Should -Match 'Edge Stable\s*: closed'
+        ($b.Info -join "`n") | Should -Match '(Pushed|Conflict) Work/Bookmarks'
+        ($b.Info -join "`n") | Should -Match '\[\s*\d+/\d+\] Work: pushed .*Bookmarks'
+        ($b.Info -join "`n") | Should -Match 'Sync finished'
+        ($b.Info -join "`n") | Should -Match 'Log file\s+: .*EdgeProfileSync-\d{8}\.log'
+        ($a.Info -join "`n") | Should -Match '(Pulled|Conflict) Work/Bookmarks'
+        ($a.Info -join "`n") | Should -Match '\[\s*\d+/\d+\] Work: pulled .*Bookmarks'
+        ($a.Info -join "`n") | Should -Match 'Data\s+: .* pulled'
+        # InSync items get no line of their own.
+        ($a.Info -join "`n") | Should -Not -Match 'Work/Settings'
+    }
+
     It 'throws on a missing SyncRoot configuration' {
         $env:EDGEPROFILESYNC_HOME = Join-Path $TestDrive 'home-noroot'
         $savedA = $env:OneDrive; $savedB = $env:OneDriveCommercial
