@@ -1,0 +1,6 @@
+# Test output and local artifacts
+tests/TestResults*.xml
+*.zip
+*.log
+.vscode/
+.idea/
