@@ -571,8 +571,8 @@ Describe 'Backup and restore' {
             $res = @(Restore-EdgeProfiles -Path $r.Path -UserDataRoot $script:UD -PassThru)
             $res.Count | Should -BeGreaterThan 0
             foreach ($o in $res) { $o.PSObject.Properties.Name | Should -Contain 'Action' }
-            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match '\[1/2\] Personal -> Default: \d+ categories restored' }
-            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match 'Restore of Edge Stable finished' }
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match '^\s+1  Personal\s+Default\s+\d+' }
+            Should -Invoke -ModuleName EdgeProfileSync Write-Host -ParameterFilter { "$Object" -match 'Restore finished in' }
 
             $profiles = @(Get-EdgeProfile -UserDataRoot $script:UD -IncludeSize -SyncRoot (Join-Path $TestDrive 'nosync'))
             $profiles.Count | Should -Be 2

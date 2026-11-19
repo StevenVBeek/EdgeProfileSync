@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] - 2026-11-19
+
+### Changed
+
+- Clearer console output for `Backup-EdgeProfiles` and `Restore-EdgeProfiles`: a boxed header with all
+  settings, an aligned table with one row per profile (folder, categories, files, size, time, notes) and a
+  total row, and a boxed summary. The backup summary shows the matching restore command.
+- README: step-by-step "start fresh on a PC from a backup".
+
 ## [2.1.0] - 2026-11-19
 
 ### Added

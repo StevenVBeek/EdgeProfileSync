@@ -163,9 +163,9 @@ $ProgressPreference = 'SilentlyContinue'
 Backup-EdgeProfiles 6>$null
 ```
 
-Backup, restore, sync and cleanup show what they are doing: a header with source, target and Edge
-state, a progress bar with percentage, size, speed and remaining time, one line per profile and a
-summary at the end. The scheduled task runs `Sync-EdgeProfiles -Quiet`, which only writes the log.
+Backup, restore, sync and cleanup show what they are doing: a boxed header with source, target and
+Edge state, a progress bar with percentage, size, speed and remaining time, an aligned table with one
+row per profile and a total, and a boxed summary at the end. The scheduled task runs `Sync-EdgeProfiles -Quiet`, which only writes the log.
 
 **How long does a backup take?** Measured with 24 profiles, Edge open, real-time antivirus on:
 
@@ -180,6 +180,30 @@ Antivirus scans every file the first time it is opened, which makes zipping tens
 extension files slow; robocopy (`-Format Folder`) is not affected the same way.
 
 ### Restore
+
+**Start fresh on a PC from a backup** (old profiles out, exactly the profiles of the backup in):
+
+```powershell
+$backup = "$env:OneDrive\Edge_Backup\EdgeStable"
+
+# 1. Preview: what would happen
+Restore-EdgeProfiles -Path $backup -ExistingDataAction Rename -CloseEdge -WhatIf
+
+# 2. Do it: Edge is closed, the current "User Data" is renamed to "User Data-<timestamp>" (nothing is
+#    deleted) and a fresh one is built with the profiles from the backup
+Restore-EdgeProfiles -Path $backup -ExistingDataAction Rename -CloseEdge
+
+# 3. On another PC than the one the backup came from: reinstall the extensions (one click each)
+Install-EdgeProfileExtension
+
+# 4. Everything fine? Delete the old folder (the restore summary shows its path)
+Remove-Item "$env:LOCALAPPDATA\Microsoft\Edge\User Data-20261119-133140" -Recurse
+```
+
+Use `-ExistingDataAction Remove` instead of `Rename` to delete the old User Data automatically after a
+successful restore. No separate cleanup is needed beforehand.
+
+Other restores:
 
 ```powershell
 # Restore from a folder backup (made with -Format Folder) works the same way

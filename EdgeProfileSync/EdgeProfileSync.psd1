@@ -1,6 +1,6 @@
 @{
     RootModule           = 'EdgeProfileSync.psm1'
-    ModuleVersion        = '2.1.0'
+    ModuleVersion        = '2.1.1'
     CompatiblePSEditions = @('Core')
     GUID                 = '1bd59bae-471a-4f90-b06e-12045f6c6c53'
     Author               = 'Steven van Beek (based on EdgeProfiles by Michael Mardahl)'
@@ -31,6 +31,8 @@
             LicenseUri   = 'https://github.com/StevenVBeek/EdgeProfileSync/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/StevenVBeek/EdgeProfileSync'
             ReleaseNotes = @'
+2.1.1 - clearer console output for backup and restore: boxed header and summary, aligned table per profile.
+
 2.1.0 - detailed progress (header, progress bars with speed and ETA, per-profile lines, summary) for backup,
 restore, sync and cleanup; Backup-EdgeProfiles -Format Folder (robocopy, incremental); faster zip backups
 (parallel readers, no temporary copy); unreadable files are skipped and reported instead of failing.

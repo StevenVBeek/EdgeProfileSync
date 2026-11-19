@@ -114,9 +114,7 @@ function Restore-EdgeProfiles {
     # A backup is either a zip or a folder made with Backup-EdgeProfiles -Format Folder.
     $isFolder = Test-Path -LiteralPath $zipPath -PathType Container
     $zipSize = Get-EdgePathSize -Path $zipPath
-    Write-EdgeStatus ''
-    Write-EdgeStatus ("Restore of Edge backup '{0}' ({1}{2})" -f (Split-Path $zipPath -Leaf), (Format-EdgeSize $zipSize), ($isFolder ? ', folder' : '')) -Level Header
-    Write-EdgeStatus "  Backup      : $zipPath" -Level Header
+    $backupText = '{0} ({1}, {2})' -f $zipPath, ($isFolder ? 'folder' : 'zip'), (Format-EdgeSize $zipSize)
 
     $staging = $isFolder ? $zipPath : (Join-Path ([System.IO.Path]::GetTempPath()) "EdgeProfileSync-restore-$([guid]::NewGuid().ToString('N').Substring(0, 12))")
     $progress = $null
@@ -124,14 +122,14 @@ function Restore-EdgeProfiles {
         if ($isFolder) {
             $isV2 = Test-Path -LiteralPath (Join-Path $staging 'backup-manifest.json') -PathType Leaf
             if (-not $isV2) { throw "'$zipPath' is a folder but contains no backup-manifest.json (not made by Backup-EdgeProfiles -Format Folder)." }
-            Write-EdgeStatus 'Folder backup: restoring directly from the folder (no extraction needed).' -Level Step
         }
         else {
             Write-Verbose "Extracting '$zipPath' to '$staging'"
-            Write-EdgeStatus "Extracting the backup to a temporary folder..." -Level Step
+            Write-EdgeNote ''
+            Write-EdgeNote "Extracting $(Split-Path $zipPath -Leaf) to a temporary folder..." -Level Info
             $extract = Expand-EdgeZipToDirectory -ZipPath $zipPath -Destination $staging -Activity "Extracting $(Split-Path $zipPath -Leaf)"
             $isV2 = $extract.IsV2
-            Write-EdgeStatus ('Extracted {0} file(s), {1} in {2}.' -f $extract.Files, (Format-EdgeSize $extract.Bytes), (Format-EdgeDuration $extract.Duration))
+            Write-EdgeNote ('Extracted {0:N0} file(s), {1}, in {2}' -f $extract.Files, (Format-EdgeSize $extract.Bytes), (Format-EdgeDuration $extract.Duration))
         }
 
         # ------------------------------------------------------------------ 1.x zip
@@ -139,7 +137,11 @@ function Restore-EdgeProfiles {
             $ch = $Channel ? $Channel : 'Stable'
             $info = Get-EdgeChannelInfo -Channel $ch -UserDataRoot $UserDataRoot
             $userData = $info.UserDataPath
-            Write-EdgeStatus "Legacy EDGEProfiles 1.x backup detected; restoring the whole User Data folder of Edge $ch (action: $ExistingDataAction)."
+            Write-EdgeBox -Title "Restore - Edge $ch (EDGEProfiles 1.x backup)" -Rows ([ordered]@{
+                    'Backup' = $backupText
+                    'Target' = $userData
+                    'Action' = "$ExistingDataAction - the whole User Data folder is replaced$($CloseEdge ? ', Edge is closed first' : '')"
+                })
             if ($ProfileName -or $Category) { Write-Warning '-Profile and -Category are ignored for 1.x backups.' }
             if ($ExistingDataAction -eq 'Merge') {
                 Write-Warning '1.x backups replace the whole User Data folder: -ExistingDataAction Merge is treated as Rename.'
@@ -154,29 +156,29 @@ function Restore-EdgeProfiles {
             $null = Assert-EdgeRestoreAllowed -Channel $ch -CloseEdge:$CloseEdge -RequireClosed -Cmdlet $PSCmdlet
             $oldUserData = Move-EdgeUserDataAside -UserDataPath $userData -Action $ExistingDataAction -Timestamp $timestamp -Force:$Force -Cmdlet $PSCmdlet
             if ($null -eq $oldUserData -and $ExistingDataAction -ne 'Merge' -and (Test-Path -LiteralPath $userData) -and -not $WhatIfPreference) { return }
-            if ($oldUserData) { Write-EdgeStatus "Previous User Data renamed to '$oldUserData'." -Level Step }
+            if ($oldUserData) { Write-EdgeNote "Previous User Data renamed to '$oldUserData'." -Level Step }
 
             if ($PSCmdlet.ShouldProcess($userData, 'Restore User Data from 1.x backup')) {
                 $copySw = [System.Diagnostics.Stopwatch]::StartNew()
-                Write-EdgeStatus ('Copying User Data ({0}) to {1}...' -f (Format-EdgeSize (Get-EdgePathSize -Path $src)), $userData) -Level Step
+                Write-EdgeNote ('Copying User Data ({0}) to {1}...' -f (Format-EdgeSize (Get-EdgePathSize -Path $src)), $userData) -Level Step
                 Invoke-EdgeRobocopy -Source $src -Destination $userData
-                Write-EdgeStatus ('User Data copied in {0}.' -f (Format-EdgeDuration $copySw.Elapsed))
+                Write-EdgeNote ('User Data copied in {0}.' -f (Format-EdgeDuration $copySw.Elapsed))
                 & $addResult $ch '*' '*' 'Legacy' 'Restored' $zipPath
             }
             if ($REGSource) {
                 if ($UserDataRoot) { Write-Verbose 'Test User Data root in use; registry import skipped.' }
                 elseif (-not (Test-Path -LiteralPath $REGSource -PathType Leaf)) { Write-Warning "Registry file '$REGSource' not found; not imported." }
                 elseif ($PSCmdlet.ShouldProcess($REGSource, 'Import registry file')) {
-                    Write-EdgeStatus "Importing registry file '$REGSource'..." -Level Step
+                    Write-EdgeNote "Importing registry file '$REGSource'..." -Level Step
                     Import-EdgeRegistryFile -Path $REGSource
                 }
             }
             if ($ExistingDataAction -eq 'Remove' -and $oldUserData -and $PSCmdlet.ShouldProcess($oldUserData, 'Delete previous User Data')) {
-                Write-EdgeStatus "Deleting previous User Data '$oldUserData'..." -Level Step
+                Write-EdgeNote "Deleting previous User Data '$oldUserData'..." -Level Step
                 Remove-Item -LiteralPath $oldUserData -Recurse -Force
             }
             $sw.Stop()
-            Write-EdgeStatus ('Edge {0} restore (1.x backup) completed in {1}.{2}' -f $ch, (Format-EdgeDuration $sw.Elapsed),
+            Write-EdgeNote ('Edge {0} restore (1.x backup) completed in {1}.{2}' -f $ch, (Format-EdgeDuration $sw.Elapsed),
                 (($oldUserData -and $ExistingDataAction -ne 'Remove') ? " Previous User Data: $oldUserData" : '')) -Level Success
             if ($PassThru) { $results }
             return
@@ -205,17 +207,23 @@ function Restore-EdgeProfiles {
             catch { $created = [string]$manifest['CreatedUtc'] }
         }
         $origin = @($manifest['ComputerName'], $manifest['MachineId']) | Where-Object { $_ } | Select-Object -Unique
-        Write-EdgeStatus ('  Created     : {0} on {1}{2}' -f ($created ? $created : 'unknown'), ($origin ? ($origin -join ' / ') : 'unknown machine'),
-            ($sameMachine ? ' (this machine)' : ' (another machine)')) -Level Header
-        Write-EdgeStatus ('  Channel     : Edge {0}{1} -> {2}' -f $srcChannel, ($manifest['Full'] ? ' (full User Data backup)' : ''), $userData) -Level Header
-        if (-not $manifest['Full']) {
-            Write-EdgeStatus ('  Profiles    : {0} of {1} in the backup{2}' -f $backupProfiles.Count, @($manifest['Profiles']).Count,
-                ($backupProfiles ? ": $(($backupProfiles | ForEach-Object { [string]$_['Name'] }) -join ', ')" : '')) -Level Header
-            Write-EdgeStatus ('  Categories  : {0}' -f ($wanted ? (($wanted | ForEach-Object { $_.Name }) -join ', ') : '(none)')) -Level Header
+        $actionText = switch ($ExistingDataAction) {
+            'Merge' { 'Merge - restore into the existing profiles (replaced files are kept aside)' }
+            'Rename' { 'Rename - current User Data is renamed aside, then a fresh one is built from the backup' }
+            'Remove' { 'Remove - current User Data is deleted after a successful restore' }
         }
-        Write-EdgeStatus ('  Action      : {0}{1}{2}' -f $ExistingDataAction, ($CloseEdge ? ', close Edge' : ''), ($WhatIfPreference ? ' (WhatIf: nothing is changed)' : '')) -Level Header
+        Write-EdgeBox -Title ("Restore - Edge $ch$($WhatIfPreference ? ' (WhatIf: nothing is changed)' : '')") -Rows ([ordered]@{
+                'Backup'     = $backupText
+                'Created'    = '{0} on {1}{2}' -f ($created ? $created : 'unknown'), ($origin ? ($origin -join ' / ') : 'unknown machine'), ($sameMachine ? ' (this machine)' : ' (another machine)')
+                'Target'     = "$userData$($manifest['Full'] ? ' (full User Data backup)' : '')"
+                'Profiles'   = $manifest['Full'] ? $null : ('{0} of {1} in the backup' -f $backupProfiles.Count, @($manifest['Profiles']).Count)
+                'Categories' = $manifest['Full'] ? $null : ($wanted ? (($wanted | ForEach-Object { $_.Name }) -join ', ') : '(none)')
+                'Action'     = "$actionText$($CloseEdge ? '; Edge is closed first' : '')"
+                'Started'    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            })
         if (-not $sameMachine) {
-            Write-EdgeStatus "Backup was made on '$($manifest['MachineId'])' (this machine: '$machineId'): machine-bound data (SecurePreferences, Extensions, registry) is not restored." -Level Warning
+            Write-EdgeNote 'Backup from another machine: machine-bound data (SecurePreferences, extension binaries, registry) is not restored;' -Level Warning
+            Write-EdgeNote 'extensions are listed for reinstall (Install-EdgeProfileExtension).' -Level Warning
         }
 
         if (-not $backupProfiles -and -not $manifest['Full']) {
@@ -227,12 +235,12 @@ function Restore-EdgeProfiles {
         # profiles to be not loaded (checked per profile below).
         $requireClosed = $ExistingDataAction -ne 'Merge' -or [bool]$manifest['Full']
         $edgeRunning = Assert-EdgeRestoreAllowed -Channel $ch -CloseEdge:$CloseEdge -RequireClosed:$requireClosed -Cmdlet $PSCmdlet
-        if ($edgeRunning) { Write-EdgeStatus "Edge $ch is running: profiles that are open in Edge, and profiles that have to be created, are skipped." -Level Warning }
+        if ($edgeRunning) { Write-EdgeNote "Edge $ch is running: profiles that are open in Edge, and profiles that have to be created, are skipped." -Level Warning }
 
         $fresh = $ExistingDataAction -ne 'Merge' -or -not (Test-Path -LiteralPath $userData -PathType Container)
         $oldUserData = Move-EdgeUserDataAside -UserDataPath $userData -Action $ExistingDataAction -Timestamp $timestamp -Force:$Force -Cmdlet $PSCmdlet
         if ($null -eq $oldUserData -and $ExistingDataAction -ne 'Merge' -and (Test-Path -LiteralPath $userData) -and -not $WhatIfPreference) { return }
-        if ($oldUserData) { Write-EdgeStatus "Previous User Data renamed to '$oldUserData'." -Level Step }
+        if ($oldUserData) { Write-EdgeNote "Previous User Data renamed to '$oldUserData'." -Level Info }
 
         $pendingTotal = 0
         $restoredBytes = [long]0
@@ -246,15 +254,15 @@ function Restore-EdgeProfiles {
             if ($PSCmdlet.ShouldProcess($userData, 'Restore full User Data backup')) {
                 $copySw = [System.Diagnostics.Stopwatch]::StartNew()
                 $restoredBytes = Get-EdgePathSize -Path $src
-                Write-EdgeStatus ('Copying the full User Data backup ({0}) to {1}...' -f (Format-EdgeSize $restoredBytes), $userData) -Level Step
+                Write-EdgeNote ('Copying the full User Data backup ({0}) to {1}...' -f (Format-EdgeSize $restoredBytes), $userData) -Level Step
                 Invoke-EdgeRobocopy -Source $src -Destination $userData
-                Write-EdgeStatus ('User Data copied in {0}.' -f (Format-EdgeDuration $copySw.Elapsed))
+                Write-EdgeNote ('User Data copied in {0}.' -f (Format-EdgeDuration $copySw.Elapsed))
                 & $addResult $ch '*' '*' 'Full' 'Restored' $null
             }
         }
         else {
             if ($fresh -and $PSCmdlet.ShouldProcess($userData, 'Create User Data with the backup profiles')) {
-                Write-EdgeStatus "Creating a fresh User Data folder with $($backupProfiles.Count) profile(s)..." -Level Step
+                Write-EdgeNote "Creating a fresh User Data folder with $($backupProfiles.Count) profile(s)..." -Level Info
                 Initialize-EdgeRestoreLocalState -UserDataPath $userData -Profile $backupProfiles -SameMachine $sameMachine
             }
             $localProfiles = (Test-Path -LiteralPath $userData) ? @(Get-EdgeLocalProfile -Channel $ch -UserDataRoot $userData) : @()
@@ -273,13 +281,23 @@ function Restore-EdgeProfiles {
             }
             $progress = New-EdgeProgress -Activity "Restoring Edge $ch profiles" -Total $totalBytes -Id 1
             $profCount = $backupProfiles.Count
-            $width = "$profCount".Length
             $pIndex = 0
+            $table = New-EdgeTable -Columns @(
+                @{ Name = '#'; Width = [Math]::Max(3, "$profCount".Length); Align = 'Right' }
+                @{ Name = 'Profile'; Width = 28 }
+                @{ Name = 'Folder'; Width = 11 }
+                @{ Name = 'Restored'; Width = 8; Align = 'Right' }
+                @{ Name = 'Skipped'; Width = 7; Align = 'Right' }
+                @{ Name = 'Size'; Width = 10; Align = 'Right' }
+                @{ Name = 'Time'; Width = 8; Align = 'Right' }
+                @{ Name = 'Note'; Width = 0 }
+            )
+            Write-EdgeTableHeader -Table $table
+            $totRestored = 0; $totSkipped = 0
 
             foreach ($bp in $backupProfiles) {
                 $pIndex++
                 $key = [string]$bp['Key']; $name = [string]$bp['Name']
-                $tag = "[{0,$width}/{1}]" -f $pIndex, $profCount
                 $pSw = [System.Diagnostics.Stopwatch]::StartNew()
                 [long]$pTotal = 0
                 foreach ($k in @($catSize.Keys | Where-Object { $_ -like "$key|*" })) { $pTotal += $catSize[$k] }
@@ -288,10 +306,11 @@ function Restore-EdgeProfiles {
                 Update-EdgeProgress -Progress $progress -Status $pStatus -CurrentOperation 'Preparing' -Force
 
                 $target = $localProfiles | Where-Object { $_.Key -eq $key } | Select-Object -First 1
+                $createdNote = ''
                 if (-not $target -and $edgeRunning) {
                     Write-Warning "Profile '$name' does not exist yet; creating a profile needs Edge $ch closed. Skipped (close Edge or use -CloseEdge)."
                     & $addResult $ch $name $null '*' 'Skipped' 'Edge running: profile creation needs Edge closed'
-                    Write-EdgeStatus "$tag ${name}: skipped - needs Edge closed (profile has to be created)" -Level Warning
+                    Write-EdgeTableRow -Table $table -Values @($pIndex, $name, '(new)', '', 'all', '', '', 'skipped: creating a profile needs Edge closed') -Level Warning
                     $profSkipped++
                     Update-EdgeProgress -Progress $progress -Done ($pStart + $pTotal)
                     continue
@@ -299,7 +318,7 @@ function Restore-EdgeProfiles {
                 if ($target -and $edgeRunning -and (Test-EdgeProfileInUse -Path $target.Path)) {
                     Write-Warning "Profile '$name' ($($target.Directory)) is open in Edge $ch. Skipped (close its window(s), or use -CloseEdge)."
                     & $addResult $ch $name $target.Directory '*' 'Skipped' 'Profile is loaded in Edge'
-                    Write-EdgeStatus "$tag $name -> $($target.Directory): skipped - loaded in Edge" -Level Warning
+                    Write-EdgeTableRow -Table $table -Values @($pIndex, $name, $target.Directory, '', 'all', '', '', 'skipped: profile is open in Edge') -Level Warning
                     $profSkipped++
                     Update-EdgeProgress -Progress $progress -Done ($pStart + $pTotal)
                     continue
@@ -307,11 +326,11 @@ function Restore-EdgeProfiles {
                 if (-not $target) {
                     if ($PSCmdlet.ShouldProcess("Edge $ch", "Create profile '$name'")) {
                         $target = New-EdgeLocalProfile -Name $name -InfoCache $bp['InfoCache'] -Channel $ch -UserDataRoot $userData -WhatIf:$false -Confirm:$false
-                        Write-EdgeStatus "$tag Created profile '$name' ($($target.Directory))." -Level Step
+                        $createdNote = 'new profile'
                     }
                     else {
                         & $addResult $ch $name $null '*' 'WouldCreateProfile' $null
-                        Write-EdgeStatus "$tag ${name}: would be created as a new profile (WhatIf)" -Level Step
+                        Write-EdgeTableRow -Table $table -Values @($pIndex, $name, '(new)', '', '', '', '', 'would be created (WhatIf)') -Level Step
                         Update-EdgeProgress -Progress $progress -Done ($pStart + $pTotal)
                         continue
                     }
@@ -366,25 +385,31 @@ function Restore-EdgeProfiles {
                     $missing = @(Update-EdgePendingFromBackup -InventoryFile $extFile -Channel $ch -ProfileKey $target.Key -ProfilePath $target.Path -ProfileName $name -Cmdlet $PSCmdlet)
                     & $addResult $ch $name $target.Directory 'ExtensionList' 'Reported' "$($missing.Count) extension(s) to install"
                     $pendingTotal += $missing.Count
-                    if ($missing.Count) { $extNote = "; $($missing.Count) extension(s) to install" }
+                    if ($missing.Count) { $extNote = "$($missing.Count) extension(s) to install" }
                 }
                 Update-EdgeProgress -Progress $progress -Done ($pStart + $pTotal)
                 $restoredBytes += $pBytes
                 $pSw.Stop()
 
-                $parts = [System.Collections.Generic.List[string]]::new()
-                if ($WhatIfPreference -and $nWhatIf) { $parts.Add("$nWhatIf categories would be restored") }
-                else { $parts.Add("$nRestored categories restored") }
-                if ($skipReasons.Count) { $parts.Add("$($skipReasons.Count) skipped ($($skipReasons -join ', '))") }
-                if ($nFailed) { $parts.Add("$nFailed failed") }
-                $line = '{0} {1} -> {2}: {3} ({4}, {5}){6}' -f $tag, $name, $target.Directory, ($parts -join ', '),
-                    (Format-EdgeSize $pBytes), (Format-EdgeDuration $pSw.Elapsed), $extNote
-                if ($nFailed) { $profFailed++; Write-EdgeStatus $line -Level Warning }
-                elseif ($nRestored -or $nWhatIf) { $profRestored++; Write-EdgeStatus $line -Level Info }
-                else { $profSkipped++; Write-EdgeStatus $line -Level Warning }
+                $notes = [System.Collections.Generic.List[string]]::new()
+                if ($createdNote) { $notes.Add($createdNote) }
+                if ($WhatIfPreference -and $nWhatIf) { $notes.Add('WhatIf') }
+                if ($nFailed) { $notes.Add("$nFailed failed (see log)") }
+                if ($skipReasons.Count) { $notes.Add("skipped: $($skipReasons -join ', ')") }
+                if ($extNote) { $notes.Add($extNote) }
+                $nDone = ($WhatIfPreference -and $nWhatIf) ? $nWhatIf : $nRestored
+                $totRestored += $nDone; $totSkipped += $skipReasons.Count
+                $rowLevel = $nFailed ? 'Warning' : (($nRestored -or $nWhatIf) ? 'Info' : 'Warning')
+                Write-EdgeTableRow -Table $table -Values @($pIndex, $name, $target.Directory, $nDone, ($skipReasons.Count ? $skipReasons.Count : ''),
+                    (Format-EdgeSize $pBytes), (Format-EdgeDuration $pSw.Elapsed), ($notes -join '; ')) -Level $rowLevel
+                if ($nFailed) { $profFailed++ }
+                elseif ($nRestored -or $nWhatIf) { $profRestored++ }
+                else { $profSkipped++ }
             }
             Complete-EdgeProgress -Progress $progress
             $progress = $null
+            Write-EdgeTableRule -Table $table
+            Write-EdgeTableRow -Table $table -Values @('', 'Total', '', $totRestored, ($totSkipped ? $totSkipped : ''), (Format-EdgeSize $restoredBytes), (Format-EdgeDuration $sw.Elapsed), '')
         }
 
         # ---- registry
@@ -394,13 +419,13 @@ function Restore-EdgeProfiles {
             elseif ($UserDataRoot) { Write-Verbose 'Test User Data root in use; registry import skipped.' }
             elseif (-not $regFile -or -not (Test-Path -LiteralPath $regFile)) { Write-Warning 'The backup contains no registry export.' }
             elseif ($PSCmdlet.ShouldProcess($info.RegistryKey, 'Import registry export from backup')) {
-                Write-EdgeStatus 'Importing the registry export from the backup...' -Level Step
+                Write-EdgeNote 'Importing the registry export from the backup...' -Level Info
                 Import-EdgeRegistryFile -Path $regFile
             }
         }
 
         if ($ExistingDataAction -eq 'Remove' -and $oldUserData -and $PSCmdlet.ShouldProcess($oldUserData, 'Delete previous User Data')) {
-            Write-EdgeStatus "Deleting previous User Data '$oldUserData'..." -Level Step
+            Write-EdgeNote "Deleting previous User Data '$oldUserData'..." -Level Info
             Remove-Item -LiteralPath $oldUserData -Recurse -Force
         }
 
@@ -413,16 +438,16 @@ function Restore-EdgeProfiles {
             ($oldUserData ? "; previous User Data: $oldUserData" : '')
         Write-EdgeSyncLog -Message $msg -Level Info
 
-        Write-EdgeStatus ('Restore of Edge {0} finished in {1}' -f $ch, (Format-EdgeDuration $sw.Elapsed)) -Level ($failed ? 'Warning' : 'Success')
-        if (-not $manifest['Full']) {
-            Write-EdgeStatus ('  Profiles    : {0} {1}, {2} skipped, {3} failed (of {4})' -f $profRestored, ($WhatIfPreference ? 'would be restored' : 'restored'), $profSkipped, $profFailed, $backupProfiles.Count) -Level ($profFailed ? 'Warning' : 'Success')
-        }
-        Write-EdgeStatus ('  Categories  : {0} restored, {1} skipped, {2} failed ({3})' -f $restored.Count, $skipped.Count, $failed.Count, (Format-EdgeSize $restoredBytes)) -Level ($failed ? 'Warning' : 'Success')
         $replacedDir = Join-Path $userData "EdgeProfileSync-replaced\$timestamp"
-        if (Test-Path -LiteralPath $replacedDir -PathType Container) { Write-EdgeStatus "  Replaced    : the files that were replaced are in '$replacedDir'" }
-        if ($oldUserData -and (Test-Path -LiteralPath $oldUserData)) { Write-EdgeStatus "  Previous    : the previous User Data is in '$oldUserData'" }
-        if ($pendingTotal) { Write-EdgeStatus "  Extensions  : $pendingTotal extension(s) still to install; run Install-EdgeProfileExtension." -Level Warning }
-        if ($failed) { Write-EdgeStatus "  Failures    : $(($failed | ForEach-Object { "$($_.Profile)/$($_.Category): $($_.Reason)" }) -join '; ')" -Level Warning }
+        $boxLevel = ($failed -or $profFailed) ? 'Warning' : 'Success'
+        Write-EdgeBox -Title ('Restore {0} in {1}' -f ($WhatIfPreference ? 'preview (WhatIf) finished' : 'finished'), (Format-EdgeDuration $sw.Elapsed)) -Level $boxLevel -Rows ([ordered]@{
+                'Profiles'   = $manifest['Full'] ? $null : ('{0} {1}, {2} skipped, {3} failed (of {4})' -f $profRestored, ($WhatIfPreference ? 'would be restored' : 'restored'), $profSkipped, $profFailed, $backupProfiles.Count)
+                'Categories' = '{0} restored, {1} skipped, {2} failed ({3})' -f $restored.Count, $skipped.Count, $failed.Count, (Format-EdgeSize $restoredBytes)
+                'Replaced'   = (Test-Path -LiteralPath $replacedDir -PathType Container) ? "replaced files are kept in '$replacedDir'" : $null
+                'Previous'   = ($oldUserData -and (Test-Path -LiteralPath $oldUserData)) ? "previous User Data: '$oldUserData' (delete it when everything works)" : $null
+                'Extensions' = $pendingTotal ? "$pendingTotal extension(s) to install: run Install-EdgeProfileExtension" : $null
+                'Failures'   = $failed ? (($failed | ForEach-Object { "$($_.Profile)/$($_.Category): $($_.Reason)" }) -join '; ') : $null
+            })
         if ($PassThru) { $results }
     }
     finally {
